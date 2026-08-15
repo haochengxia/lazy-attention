@@ -126,6 +126,13 @@ class Case:
                 f"{self.doc_len} while changing offset every "
                 f"{max(self.doc_len // BLOCK_SIZE, 1)} block(s) -- a "
                 f"combination the real metadata never produces.")
+        if self.context_len % self.doc_len:
+            raise ValueError(
+                f"--context-lens {self.context_len} is not a multiple of "
+                f"--doc-lens {self.doc_len}: the last document would be a "
+                f"partial one with a different rotation density, while the "
+                f"reported document length and rotation count would describe "
+                f"whole ones.")
         if self.max_q_offset > MAX_PACKED_Q_OFFSET:
             raise ValueError(
                 f"context {self.context_len} with {self.doc_len}-token "
@@ -338,6 +345,18 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
     # performance conclusion. The bound is bf16's own resolution: the two paths
     # are not expected to be bit-identical (one rounds through a bf16 table),
     # only to agree to within it.
+    # Checked before the tolerance: a NaN anywhere makes `rel_diff` NaN, and
+    # `nan > tol` is False -- the comparison below would wave through exactly
+    # the failure it exists to catch.
+    for name, output in (("load", outputs[False]), ("compute", outputs[True])):
+        if not torch.isfinite(output).all():
+            raise AssertionError(
+                f"the {name} path produced non-finite output on "
+                f"{case.shape.name} seqs={case.num_seqs} "
+                f"ctx={case.context_len} doc={case.doc_len} "
+                f"({int((~torch.isfinite(output)).sum())} of "
+                f"{output.numel()} values) -- a correctness failure, not a "
+                f"benchmark result.")
     rel_diff = (diff.max() / scale).item()
     if rel_diff > BF16_TOLERANCE:
         raise AssertionError(
