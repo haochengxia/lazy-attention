@@ -232,13 +232,16 @@ Computing cos/sin in-kernel looks like a free win — it removes a scattered tab
 read from a memory-bound kernel — and it is not. `benchmarks/bench_rope_cos_sin.py`
 A/Bs the two paths with `COMPUTE_COS_SIN` as the *only* difference (same tensors,
 same launch), interleaved and order-alternated across repetitions, reporting
-medians with ranges so a claim is made only when the ranges separate. Numbers
-below are on an RTX 5070 Ti (sm_120), torch 2.7.0+cu128 / triton 3.4.0, bf16,
-block size 16.
+medians with ranges so a claim is made only when the ranges separate. The
+rotation metadata is built by calling the scheduler's own
+`metadata_for_lazy_attention`, so the timed layout is one the engine can
+actually emit — sequences differ by their documents' padding, which is the
+mechanism the real metadata has for shifting offsets. Numbers below are on an
+RTX 5070 Ti (sm_120), torch 2.7.0+cu128 / triton 3.4.0, bf16, block size 16.
 
 **Compute loses almost everywhere.** Across 36 cases (1–32 seqs × 1k/4k/16k
-context × 128/1024-token documents × two head sizes), 23 separated; compute lost
-all 23, median 1.12× the load time, worst 1.21×. The other 13 are reported as
+context × 128/1024-token documents × two head sizes), 28 separated; compute lost
+all 28, median 1.10× the load time, worst 1.29×. The other 8 are reported as
 inconclusive rather than assigned to whichever median came out lower.
 
 **It wins once the batch is large and the load path is register-bound.** At
@@ -246,8 +249,8 @@ inconclusive rather than assigned to whichever median came out lower.
 
 | shape | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
 |---|---|---|---|---|
-| `head_size=64` (1B)  | 1.10× | 1.07× | 1.05× | 1.05× |
-| `head_size=128` (8B) | 1.20× | 0.98× (overlapping) | **0.87×** | **0.91×** |
+| `head_size=64` (1B)  | 1.10× | 1.05× | 1.07× | 1.07× |
+| `head_size=128` (8B) | 1.23× | 1.00× (overlapping) | **0.88×** | **0.93×** |
 
 (context 4096; `<1` means compute is faster. Ranges separate except at 64 seqs.)
 
@@ -282,20 +285,20 @@ Measured at 4096 context (`--shapes` in the benchmark):
 
 | shape | regs load → compute | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
 |---|---|---|---|---|---|
-| 8B (hs 128, group 4)   | 208 → 168 | 1.20× | 0.98× | 0.87× | 0.91× |
-| 70B (hs 128, group 8)  | 208 → 165 | 1.18× | 0.97× | 0.88× | 0.91× |
-| hs 256 (group 4)       | 253 → 255 | 1.02× | 0.99× | 0.98× | 0.98× |
-| MQA (hs 128, group 32) | 255 → 234 | 0.86× | 0.92× | 0.96× | 0.92× |
+| 8B (hs 128, group 4)   | 208 → 168 | 1.23× | 1.00× | 0.88× | 0.93× |
+| 70B (hs 128, group 8)  | 208 → 165 | 1.18× | 1.00× | 0.89× | 0.93× |
+| hs 256 (group 4)       | 253 → 255 | 1.01× | 1.01× | 0.99× | 0.99× |
+| MQA (hs 128, group 32) | 255 → 234 | 0.92× | 0.92× | 0.91× | 0.94× |
 
 70B tracks 8B to within a percent at every batch size, which is the point.
-Doubling `head_size` to 256 does *not* continue the trend: it flattens to ~2%
-(separated at 128+ seqs, overlapping below), because there both paths sit at 2
+Doubling `head_size` to 256 does *not* continue the trend: it flattens to ~1%
+(only the 256-sequence case separates at all), because there both paths sit at 2
 blocks/SM and compute can no longer buy occupancy, only pay instructions. The
 large win at `head_size=128` exists because that is where the load path sits just
 above an occupancy cliff that compute drops it below.
 
 The MQA row is the exception the occupancy model does not explain — compute wins
-4–14% at *every* batch size, blocks/SM unchanged. With one KV head the grid is
+6–9% at *every* batch size, blocks/SM unchanged. With one KV head the grid is
 only `num_seqs` programs across 70 SMs, so that kernel is latency-bound rather
 than occupancy-bound; it has not been investigated further, and the load path
 there is the one that spills.
@@ -307,7 +310,7 @@ Two things came out of this analysis and are now in the code:
   is evaluated once per program and only `cos/sin(position × freqs)`
   (`rope_cos_sin_from_freqs`) stays in the loop. On the 1B shape this cut 168 → 128
   registers and restored compute's occupancy from 25% back to load's 33%, taking
-  the worst case from 1.83× to 1.21×. It is unconditional — a program evaluates
+  the worst case from 1.83× to 1.29×. It is unconditional — a program evaluates
   the frequencies even if every offset turns out to be a sentinel and no cos/sin
   is ever needed — and that is still the faster arrangement: on a context of one
   document (zero rotations) the hoisted kernel runs 1.06× load at 32 seqs where
@@ -319,7 +322,7 @@ Two things came out of this analysis and are now in the code:
 actually justify flipping the flag in production. On Llama-3.2-1B (the shape that
 loses at kernel level) the two are a wash after the hoist: 7480 vs 7384 tok/s,
 overlapping ranges. On Llama-3.2-3B — `head_size=128`, i.e. the shape that wins
-9–13% at kernel level — at 256 prompts and `max_num_seqs=256`, two runs of the
+7–12% at kernel level — at 256 prompts and `max_num_seqs=256`, two runs of the
 identical configuration gave **+2.5% and −6.3%**, both with overlapping ranges.
 Decode attention is a slice of the step, and here the slice is smaller than the
 run-to-run noise. Treat the kernel result as a reason to *measure* on a

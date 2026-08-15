@@ -197,16 +197,16 @@ runs; each becomes a Triton constexpr, so a new value compiles a new kernel.
 
 > **`LAZY_DECODE_COMPUTE_COS_SIN` is not a free win.** Measured on an RTX 5070 Ti,
 > computing cos/sin in-kernel lost every conclusive case of the default sweep
-> (23 of 36 separated; median 1.12×, worst 1.21×) because it spills registers.
+> (28 of 36 separated; median 1.10×, worst 1.29×) because it spills registers.
 > Where it wins depends on the attention shape, not on model size — 70B behaves
 > like 8B:
 >
 > | attention shape | when compute wins |
 > |---|---|
-> | `head_size=64` (e.g. Llama-3.2-1B) | never measured; 1.05–1.18× slower |
-> | `head_size=128`, GQA (8B, 70B, 405B) | ≥128 concurrent sequences, by 9–13% |
-> | `head_size=256` | ~2% at ≥128 sequences; below that, inconclusive |
-> | MQA (one KV head) | every batch size tested, by 4–14% |
+> | `head_size=64` (e.g. Llama-3.2-1B) | never measured; 1.02–1.29× slower |
+> | `head_size=128`, GQA (8B, 70B, 405B) | ≥128 concurrent sequences, by 7–12% |
+> | `head_size=256` | ~1%, and only the largest batch separates at all |
+> | MQA (one KV head) | every batch size tested, by 6–9% |
 >
 > The pattern is whether the *load* path is already register-bound: at
 > `head_size=64` it fits in 128 registers and there is no occupancy left to buy.

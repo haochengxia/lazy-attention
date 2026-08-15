@@ -43,6 +43,7 @@ import itertools
 import json
 import statistics
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import torch
 import triton
@@ -50,6 +51,7 @@ import triton
 from vllm.model_executor.layers.rotary_embedding import Llama3RotaryEmbedding
 
 from lazy.attention.ops.models.llama_v1 import kernel_paged_attention_2d_llama
+from lazy.core.sched.scheduler import metadata_for_lazy_attention
 from lazy.model_executor.rope import rope_meta_from_layer
 
 BLOCK_SIZE = 16
@@ -93,10 +95,21 @@ DEFAULT_SHAPES = ["1B", "8B"]
 # q_offset occupies 16 bits of the packed block table, so a rotation offset
 # beyond this would run into the physical-block field.
 MAX_PACKED_Q_OFFSET = 0xFFFF
-# bfloat16 keeps ~8 mantissa bits. The load path rounds cos/sin through a bf16
-# table and the compute path does not, so they differ at about this level; more
-# than this is a bug rather than rounding.
-BF16_TOLERANCE = 1e-2
+# What the agreement check can and cannot see. The load path rounds cos/sin
+# through a bf16 table, giving a relative error of ~2**-9 on the rotated Q;
+# that propagates through the scores and softmax into an absolute output error
+# of ~2e-3 for the N(0,1) inputs built here. So a sub-percent difference is
+# indistinguishable from rounding no matter how it is measured -- verified by
+# perturbing one path by 1% and watching it disappear into the noise. This
+# bound is therefore set to catch *gross* divergence: a dropped rotation, a
+# wrong block, a kernel that read the wrong offset field, all of which move
+# outputs by O(1). It is not a precision claim.
+#
+# Absolute, not relative: an output element near zero is a near-cancellation of
+# a sum over V, so its *relative* error is unbounded for reasons that have
+# nothing to do with correctness, and dividing by the tensor's peak instead
+# just makes the threshold depend on which random inputs were drawn.
+MAX_ABS_DISAGREEMENT = 0.02
 
 
 @dataclass
@@ -150,18 +163,17 @@ class Case:
 
     @property
     def max_q_offset(self) -> int:
-        """Largest +1-biased offset this case puts in the packed table."""
-        return (self.num_docs - 1) * self.doc_len + 1 + self.num_seqs - 1
+        """Largest +1-biased offset this case puts in the packed table.
 
-    @property
-    def rotations_per_seq(self) -> int:
-        """How many cos/sin pairs the kernel actually evaluates per sequence.
-
-        The first document's offset is the `1` reset sentinel, which the kernel
-        satisfies from Q_full without touching cos/sin -- so it is one fewer
-        than the document count, and a single-document context evaluates none.
+        Mirrors `metadata_for_lazy_attention`: total padding, plus the true
+        lengths of the documents ahead of the last one. `build_inputs` gives
+        sequence `i` a padding of `i % BLOCK_SIZE` per document, so the largest
+        offset is whichever of those pads maximises it.
         """
-        return max(self.num_docs - 1, 0)
+        pads = range(min(self.num_seqs, BLOCK_SIZE))
+        return max(
+            self.num_docs * pad + (self.num_docs - 1) * (self.doc_len - pad) + 1
+            for pad in pads)
 
 
 @dataclass
@@ -222,25 +234,36 @@ def build_inputs(case: Case, device: torch.device):
                              dtype=torch.int64,
                              device=device).view(num_seqs,
                                                  case.blocks_per_seq)
-    blocks_per_doc = case.doc_len // BLOCK_SIZE
-    doc_index = (torch.arange(case.blocks_per_seq, device=device) //
-                 blocks_per_doc)
-    # Rotation offsets grow per document, +1-biased, as the scheduler emits
-    # them. Sequences are given *different* absolute offsets: a single row
-    # broadcast to every sequence would have the whole batch reading the same
-    # handful of cos_sin_cache rows, which is an L2 hit rate the load path
-    # would not get in a real batch -- the same reason the KV blocks above are
-    # distinct per sequence. Document 0 keeps the `1` reset sentinel for every
-    # sequence, so the number of rotations per sequence stays exactly
-    # `case.rotations_per_seq` and only the addresses differ.
-    q_offset = (doc_index * case.doc_len + 1).to(torch.int64)
-    q_offset = q_offset.unsqueeze(0).repeat(num_seqs, 1)
-    seq_shift = torch.arange(num_seqs, dtype=torch.int64,
-                             device=device).unsqueeze(1)
-    q_offset = torch.where(doc_index.unsqueeze(0) == 0, q_offset,
-                           q_offset + seq_shift)
+    # Rotation metadata comes from the scheduler's own function rather than
+    # being written out here, so the benchmark cannot time a layout the engine
+    # would never produce. Sequences differ in their documents' *padding*,
+    # which is the mechanism the real metadata has for shifting offsets: a
+    # document's offset is the total padding plus the true lengths ahead of it,
+    # so 16 tokens of padding moves every offset in that sequence, including
+    # the first document's. Every sequence still has the same block layout and
+    # the same number of rotations -- only the addresses differ, which is the
+    # point. Broadcasting one row to the whole batch would have every sequence
+    # reading the same handful of cos_sin_cache rows: an L2 hit rate the load
+    # path would not get in a real batch, and the same reason the KV blocks
+    # above are distinct per sequence.
+    q_offset_rows, q_mask_rows = [], []
+    for seq_idx in range(num_seqs):
+        # Padding under one block keeps `doc_len` the padded length, so the
+        # block layout is identical across sequences.
+        pad = seq_idx % BLOCK_SIZE
+        document_lens = [case.doc_len - pad] * case.num_docs
+        document_lens_padded = [case.doc_len] * case.num_docs
+        row_offset, row_mask = metadata_for_lazy_attention(
+            SimpleNamespace(document_lens=document_lens,
+                            document_lens_padded=document_lens_padded),
+            BLOCK_SIZE)
+        # The scheduler emits one trailing entry for the query block; the
+        # benchmark's table is document blocks only.
+        q_offset_rows.append(row_offset[:case.blocks_per_seq])
+        q_mask_rows.append(row_mask[:case.blocks_per_seq])
+    q_offset = torch.tensor(q_offset_rows, dtype=torch.int64, device=device)
+    q_mask = torch.tensor(q_mask_rows, dtype=torch.int64, device=device)
     assert int(q_offset.max()) <= MAX_PACKED_Q_OFFSET  # Case.validate()
-    q_mask = torch.zeros_like(q_offset)
     packed = (block_ids << 32) | (q_offset << 16) | q_mask
 
     rope = Llama3RotaryEmbedding(head_size=shape.head_size,
@@ -339,6 +362,7 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
         torch.cuda.synchronize()
         outputs[compute] = kwargs["output_ptr"].clone().float()
     diff = (outputs[False] - outputs[True]).abs()
+    magnitude = torch.maximum(outputs[False].abs(), outputs[True].abs())
     scale = outputs[False].abs().max().clamp(min=1e-6)
     # A timing comparison between two paths that disagree is meaningless, so
     # this fails the run rather than printing the discrepancy underneath a
@@ -357,14 +381,15 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
                 f"({int((~torch.isfinite(output)).sum())} of "
                 f"{output.numel()} values) -- a correctness failure, not a "
                 f"benchmark result.")
-    rel_diff = (diff.max() / scale).item()
-    if rel_diff > BF16_TOLERANCE:
+    gross = diff > MAX_ABS_DISAGREEMENT
+    if gross.any():
         raise AssertionError(
-            f"load and compute disagree by {rel_diff:.3e} relative "
-            f"({diff.max().item():.3e} absolute) on {case.shape.name} "
-            f"seqs={case.num_seqs} ctx={case.context_len} doc={case.doc_len}, "
-            f"past the {BF16_TOLERANCE:.0e} bf16 tolerance -- this is a "
-            f"correctness regression, not a benchmark result.")
+            f"load and compute disagree grossly on {case.shape.name} "
+            f"seqs={case.num_seqs} ctx={case.context_len} doc={case.doc_len}: "
+            f"{int(gross.sum())} of {diff.numel()} elements past "
+            f"{MAX_ABS_DISAGREEMENT} absolute (worst {diff.max().item():.3e}, "
+            f"bf16 cos/sin rounding lands near 2e-3) -- this is a correctness "
+            f"regression, not a benchmark result.")
 
     timings = {False: Timing(), True: Timing()}
     for rep in range(reps):
@@ -376,13 +401,21 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
             timings[compute].per_iter_ms.append(
                 time_variant(kwargs, compute, case, iters))
 
+    # How many cos/sin pairs a sequence actually evaluates, counted off the
+    # metadata that was generated rather than predicted from the case: the
+    # kernel fetches one whenever the offset changes to a non-sentinel value.
+    offsets = kwargs["q_offset_ptr"]
+    changes = (offsets[:, 1:] != offsets[:, :-1]) & (offsets[:, 1:] > 1)
+    rotations = changes.sum(dim=1) + (offsets[:, 0] > 1)
+    mean_rotations = rotations.float().mean().item()
+
     load, comp = timings[False], timings[True]
     result = dict(
         shape=case.shape.name,
         num_seqs=case.num_seqs,
         context_len=case.context_len,
         doc_len=case.doc_len,
-        rotations_per_seq=case.rotations_per_seq,
+        rotations_per_seq=mean_rotations,
         load_ms=load.median,
         load_range=[load.lo, load.hi],
         compute_ms=comp.median,
@@ -439,10 +472,13 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
     # alike), which trips `assert num_new_tokens > 0` in the lazy scheduler.
     # The documents are deliberately *not* varied: reusing a hot corpus across
     # requests is the case LazyAttention exists for.
-    def query_set(tag: str) -> list[str]:
+    def query_set(measurement: int) -> list[str]:
+        # Numbered by measurement, never by variant name: "load" and "compute"
+        # can tokenize to different lengths, which would hand the two sides
+        # different prefill and decode work on some tokenizers.
         return [
-            f"Question {tag}-{idx}: what do the documents describe? Answer:"
-            for idx in range(num_prompts)
+            f"Question {measurement}-{idx}: what do the documents describe? "
+            f"Answer:" for idx in range(num_prompts)
         ]
 
     # max_num_seqs is the variable under test: the kernel-level win only
@@ -453,27 +489,36 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
     sampling = SamplingParams(max_tokens=max_tokens, temperature=0,
                               ignore_eos=True)
 
-    def one_round(tag: str) -> tuple[float, int]:
+    def one_round(measurement: int) -> tuple[float, int]:
         start = time.perf_counter()
-        outputs = llm.generate(prompts=query_set(tag), sampling_params=sampling,
+        outputs = llm.generate(prompts=query_set(measurement),
+                               sampling_params=sampling,
                                document_seqs=documents, use_tqdm=False)
         elapsed = time.perf_counter() - start
         return elapsed, sum(len(o.outputs[0].token_ids) for o in outputs)
 
     results: dict[str, list[float]] = {"load": [], "compute": []}
+    measurement = 0
     for round_idx in range(rounds + 1):
         for name in (("load", "compute")
                      if round_idx % 2 == 0 else ("compute", "load")):
             os.environ["LAZY_DECODE_COMPUTE_COS_SIN"] = (
                 "1" if name == "compute" else "0")
-            elapsed, tokens = one_round(f"r{round_idx}{name}")
+            measurement += 1
+            elapsed, tokens = one_round(measurement)
             if round_idx == 0:
                 continue  # warmup round: JIT compile + cache warm
             results[name].append(tokens / elapsed)
     os.environ.pop("LAZY_DECODE_COMPUTE_COS_SIN", None)
 
+    concurrency = min(num_prompts, max_num_seqs)
     print(f"\nend to end ({model}, {max_tokens} tokens x {num_prompts} "
-          f"prompts, max_num_seqs={max_num_seqs}, {rounds} rounds)")
+          f"prompts, max_num_seqs={max_num_seqs} -> at most {concurrency} "
+          f"concurrent, {rounds} rounds)")
+    if concurrency < max_num_seqs:
+        print(f"  note: only {num_prompts} prompts were submitted, so the "
+              f"{max_num_seqs}-sequence regime this switch is measured in was "
+              f"never reached -- raise --e2e-prompts")
     for name, values in results.items():
         print(f"  {name:>8}: {statistics.median(values):8.1f} tok/s   "
               f"(range {min(values):.1f} - {max(values):.1f})")
@@ -504,7 +549,9 @@ def main() -> int:
     parser.add_argument("--e2e-model", default="hxia7/Llama-3.2-1B-Block-FT")
     parser.add_argument("--e2e-rounds", type=int, default=4)
     parser.add_argument("--e2e-max-tokens", type=int, default=128)
-    parser.add_argument("--e2e-prompts", type=int, default=16)
+    # Defaulted to the concurrency limit: a smaller number silently
+    # measures a small-batch run under a large-batch label.
+    parser.add_argument("--e2e-prompts", type=int, default=256)
     parser.add_argument("--e2e-max-num-seqs", type=int, default=256)
     parser.add_argument("--e2e-gpu-util", type=float, default=0.6)
     args = parser.parse_args()
@@ -547,7 +594,7 @@ def main() -> int:
         results.append(result)
         print(f"{result['shape']:>5} {result['num_seqs']:>5} "
               f"{result['context_len']:>6} {result['doc_len']:>5} "
-              f"{result['rotations_per_seq']:>5} "
+              f"{result['rotations_per_seq']:>5.1f} "
               f"{result['load_ms']:>9.4f} {result['compute_ms']:>11.4f} "
               f"{result['ratio']:>7.3f} "
               f"{'yes' if result['separated'] else 'no':>4} "
