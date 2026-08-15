@@ -113,9 +113,12 @@ A document request:
 * may be served **entirely** from cache. The base manager caps a hit at
   `num_tokens - 1` so the last token can produce logits; a document never samples,
   so the cap is lifted (`get_computed_blocks`);
-* deliberately does **not** forward `lora_request` — upstream folds the LoRA id
-  into every block hash, so a LoRA document would populate blocks its parent could
-  never match. Documents + LoRA is unsupported, not silently broken.
+* deliberately does **not** forward `lora_request` — and that is exactly why
+  documents + LoRA is **rejected at input validation** rather than left to run.
+  Both the lookup and the write go through this method, so their hashes agree
+  and the parent *would* proceed — attending to document KV computed by the base
+  model while its own query and decoding run under the adapter. Nothing errors;
+  the answer is just wrong, which is the worst way to fail.
 
 Once every document is ready, `merge_documents()` splices the padded document
 tokens in front of the query and the request becomes an ordinary request whose
@@ -143,6 +146,12 @@ Two rules, and both matter:
 * **Query blocks** use `hash_request_tokens_with_doc_hash`, which seeds the chain
   with `document_seq_hash` instead of `None`. Identical queries behind different
   document sets must not alias, and they don't.
+
+  The **boundaries** are part of that seed, not just the tokens. One 32-token
+  document and two 16-token ones can flatten to the same token sequence, but
+  they are encoded block-diagonally into different KV, so seeding them alike
+  would let a query block computed against one be reused for the other. The
+  hash is taken over the documents as a tuple of tuples for that reason.
 
 ## 4. The rotation metadata
 
@@ -221,11 +230,15 @@ model's RoPE parameters (base, Llama-3 scaling factors) forwarded as constexpr v
 
 The decode kernel needs three numbers per block: physical block index, `q_offset`,
 `q_mask`. Rather than three loads, `LazyGPUModelRunner` maintains a persistent
-`int64` table with all three packed:
+`int64` table — one **per KV cache group**, since a block id only means anything
+inside the group that allocated it — with all three packed:
 
 ```
 [ physical_block_idx : 32 | q_offset : 16 | q_mask : 16 ]
 ```
+
+Each layer is handed the table for its own group (`layer_name → group`); the
+rotation tensors beside it are group-independent and shared.
 
 It is rebuilt in full when the batch composition changes (additions, removals, or
 attention-backend reordering — detected by comparing the `req_ids` tuple, plus a
@@ -303,8 +316,11 @@ Two entry points use it:
   the spawned process, since patches applied in the parent do not survive the fork
   boundary under multiprocessing.
 
-`ctxmgr.LazyAttentionContextManager` reuses the same registry for scoped patching
-(`with LazyAttentionContextManager(): ...`), with matching revert paths.
+`ctxmgr.LazyAttentionContextManager` reuses the same registry to scope the
+**attention patches only** (`with LazyAttentionContextManager(): ...`), with
+matching revert paths. It is not a scoped `apply_all_patches`: inside the block
+the frontend is still stock vLLM, so it serves kernel work, not document
+requests.
 
 Every patch also records the original, so `revert_all_patches()` restores stock
 vLLM in place. Applying the patch set additionally forces
@@ -345,8 +361,13 @@ out of every score by `q_mask`.
   is asserted off.
 * **Prefix caching must stay enabled** — per-document reuse *is* prefix caching,
   applied per document.
-* **Unsupported**: `n > 1`, documents + LoRA, pooling and encoder-decoder models,
-  prompt adapters, tracing.
+* **Unsupported, and refused rather than run**: `n > 1` **with documents**
+  (document-free requests keep upstream's parallel sampling), documents + LoRA,
+  documents + pooling. Encoder-decoder models, prompt adapters and tracing are
+  unsupported upstream on this path.
+* **KV cache groups** must all use the scheduler's block size — the rotation
+  metadata is per block at one block size. Each group gets its own packed block
+  table; a group on a different block size is refused.
 * **Prompt shape**: documents are always merged **in front of** the prompt, in the
   given order. A preamble that must precede the documents has to be the first
   element of `document_seqs`.
@@ -357,7 +378,7 @@ out of every score by `q_mask`.
 lazy/
   __vllm__.py             import this to patch vLLM              (§7)
   vllm_patch.py           the patch registry                     (§7)
-  ctxmgr.py               scoped patching
+  ctxmgr.py               scoped patching, attention path only
   request.py              LazyRequest, document_request()        (§3.2)
   entrypoints/llm.py      LazyLLM.generate(document_seqs=...)    (§3)
   engine/

@@ -39,15 +39,21 @@ the attention stack in place, and forces
 `LazyLLM` — importing `lazy.entrypoints.llm.LazyLLM` explicitly works too and is
 equivalent.
 
-For scoped patching (tests, A/B in one process):
+`LazyAttentionContextManager` is **not** a scoped version of this. It applies
+the attention-path patches only — the RoPE classes, the attention layer and the
+Triton backend — and arranges for the engine-core subprocess to do the same. It
+leaves `vllm.LLM`, the processor and the scheduler alone, so `document_seqs`
+inside the block would be an unexpected keyword argument:
 
 ```python
 from lazy.ctxmgr import LazyAttentionContextManager
 
 with LazyAttentionContextManager():
-    ...   # patched here
-# reverted on exit
+    ...   # lazy kernels, stock frontend
 ```
+
+Use it to get the lazy kernels into a process (kernel tests, profiling); use
+`import lazy.__vllm__` for anything that sends documents.
 
 ## 3. Offline inference
 
@@ -75,8 +81,9 @@ print(out[0].outputs[0].text)
 ```
 
 `document_seqs` is a list parallel to `prompts`: element *i* is the list of
-documents for prompt *i*. Omit it (or pass `None`) and the request runs as
-ordinary vLLM.
+documents for prompt *i*. Omit it (or pass `None`) and the request is handed
+straight to upstream vLLM — including features the document path cannot offer,
+such as parallel sampling (`n > 1`).
 
 ### What the engine does with it
 
@@ -143,7 +150,10 @@ Ordinary vLLM arguments, with two constraints:
 * **`enable_prefix_caching` must stay on** (vLLM V1's default). Per-document reuse
   *is* prefix caching, applied per document; with it off, documents never register
   as ready.
-* **`n` must be 1.** Parallel sampling is not implemented on the lazy path.
+* **`n` must be 1 for requests with documents** (document-free requests are
+  unaffected). Parallel sampling is not implemented on the lazy path.
+* **Documents cannot be combined with LoRA or pooling params** — both are
+  rejected with an error explaining why (see [design.md §9](./design.md#9-scope-and-limitations)).
 * `block_size` (default 16) sets the padding granularity — every document is
   rounded up to a whole number of blocks.
 
@@ -166,7 +176,7 @@ Booleans accept `1/true/yes/on`.
 
 | variable | effect |
 |---|---|
-| `NO_LAZY` | force every request onto the vanilla path (A/B without restarting) |
+| `NO_LAZY` | clear the per-request lazy flag in the attention wrapper. **A negative control, not a baseline** — see below |
 | `LAZY_FORCE_SPLIT_DECODE` | use the lazy-only decode kernel when the whole batch is lazy |
 | `LAZY_DECODE_IGNORE_Q_MASK` | drop the document padding mask (measurement only — changes results) |
 | `LAZY_DECODE_COMPUTE_COS_SIN` | compute cos/sin in-kernel instead of loading `cos_sin_cache` |
@@ -175,6 +185,15 @@ Booleans accept `1/true/yes/on`.
 
 The decode switches are read **per call**, so a benchmark can flip them between
 runs; each becomes a Triton constexpr, so a new value compiles a new kernel.
+
+> **`NO_LAZY` does not produce an ordinary-vLLM baseline.** It only clears the
+> flag the kernel branches on. By then the scheduler has already merged the
+> request and its documents are already cached document-locally, so the vanilla
+> branch applies neither the per-document query rotation nor `q_mask` — the
+> attention is wrong, not vanilla. It is useful for isolating the kernel's cost,
+> and for confirming a regression comes from the rotation path. For a real
+> baseline, send the same documents inline in the prompt with no `document_seqs`
+> (which is what `scripts/validate_lazy.py` and the `baseline` benchmark SUT do).
 
 | variable | logs |
 |---|---|
@@ -240,12 +259,14 @@ every document of a request at once.
 **`Unsupported lazy attention variant '…'`** — `LAZY_ATTENTION_VARIANT` accepts
 only `lazy`/`mepic` and their aliases.
 
-**`n > 1 is not supported`** — parallel sampling is not implemented on the lazy
-path; issue *n* separate requests.
+**`n > 1 is not supported` with documents** — parallel sampling is not
+implemented on the lazy path; issue *n* separate requests. Document-free
+requests are unaffected.
 
-**Documents + LoRA silently never match.** It is unsupported by construction:
-upstream folds the LoRA id into every block hash, so a LoRA document would
-populate blocks its parent could never look up. Use one or the other.
+**Documents + LoRA is refused.** The document prefill runs the base model, and
+both sides of the document hash omit the adapter — so the request would not
+fail, it would quietly attend to base-model KV under a LoRA query and answer
+wrongly. Send the documents inline in the prompt, or drop the adapter.
 
 **Triton compile errors on RTX 50-series (`sm_120`).** Triton 3.3 cannot compile
 `tl.dot` for Blackwell; `bash scripts/install.sh --check` reports this, and the
