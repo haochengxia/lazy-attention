@@ -412,16 +412,42 @@ class LazyScheduler(Scheduler):
                 # gate further up still runs every time, so documents evicted
                 # while the request was preempted are respawned before it is
                 # scheduled again.
-                if request.has_documents and request.merge_documents():
+                drop_first_cached_block = (IS_MEPIC
+                                           and MEPIC_FIRST_BLOCK_RECOMPUTE)
+                # Called once: it is what decides whether this is the request's
+                # first pass, and calling it again would report "already
+                # merged" and skip the whole block.
+                just_merged = (request.has_documents
+                               and request.merge_documents())
+                if (request.has_documents and not just_merged
+                        and drop_first_cached_block):
+                    # A resumed request skips the per-document lookup below,
+                    # which is the only thing that applies this switch -- the
+                    # ordinary `get_computed_blocks` above happily reuses the
+                    # first block of every document, the blocks the switch
+                    # exists to recompute. Dropping that hit keeps the switch
+                    # meaning what it says. It costs a full recompute, on an
+                    # ablation path, only when memory pressure preempted the
+                    # request; a silently inapplicable ablation costs more.
+                    # Safe under MEPIC specifically: RoPE there rotates Q only,
+                    # so recomputing the merged prompt writes the same
+                    # position-independent K as the per-document prefill did.
+                    new_computed_blocks = (
+                        self.kv_cache_manager.create_empty_block_list())
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = 0
+                    logger.debug(
+                        "MEPIC first-block recompute: request %s resumed, "
+                        "dropping its prefix-cache hit so the switch still "
+                        "applies.", request.request_id)
+
+                if just_merged:
                     # Case 2 -> Case 1.2
                     lazy_doc_merges += 1
                     logger.debug(f"Request {request.request_id} merges "
                                  f"documents, total prompt len "
                                  f"{request.num_prompt_tokens}")
 
-                    drop_first_cached_block = (
-                        IS_MEPIC and MEPIC_FIRST_BLOCK_RECOMPUTE
-                    )
                     computed_blocks_docs, num_computed_tokens_docs = \
                         self.kv_cache_manager.get_computed_blocks_docs(
                             request,

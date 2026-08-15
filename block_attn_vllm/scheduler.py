@@ -41,8 +41,40 @@ class BlockAttnScheduler(LazyScheduler):
         # by this step's forward).
         for req in reversed(deferred):
             self.waiting.appendleft(req)
+        self._reject_resumed_lazy_requests(output)
         self._apply_copy_on_write(output)
         return output
+
+    def _reject_resumed_lazy_requests(self, output) -> None:
+        """Preemption is not supported on this path, and must not be silent.
+
+        `_apply_copy_on_write` only walks `scheduled_new_reqs`, so a request
+        that was preempted and resumed gets no rotated copies -- and preemption
+        already freed the ones it had. Its block table then points at the
+        canonical, offset-0 document blocks, while the runner has permanently
+        set its `q_offset` to 1 (the rotation lives in the copies here, not in
+        the query). Unrotated keys with an unrotated query is not a degraded
+        answer, it is a wrong one, with nothing raised.
+
+        The lazy scheduler used to crash on any resumed document request, which
+        is why this never surfaced; now that it survives there, this path has to
+        say so itself. Fixing it properly means recreating and re-rotating the
+        copies for resumed requests, which is worth doing -- this is the
+        placeholder that stops it being answered wrongly until then.
+        """
+        cached = output.scheduled_cached_reqs
+        for idx, req_id in enumerate(cached.req_ids):
+            if not cached.resumed_from_preemption[idx]:
+                continue
+            request = self.requests.get(req_id)
+            if request is not None and getattr(request, "has_documents", False):
+                raise NotImplementedError(
+                    f"Block-Attention cannot resume request {req_id} after "
+                    f"preemption: its rotated document copies were freed and "
+                    f"are not recreated, so it would attend to unrotated keys "
+                    f"with an unrotated query. Give the engine enough KV cache "
+                    f"to avoid preemption (raise gpu_memory_utilization, or "
+                    f"lower max_num_seqs), or run the `lazy` variant.")
 
     def _defer_queries_with_uncomputed_docs(self) -> list:
         kept: deque = deque()
