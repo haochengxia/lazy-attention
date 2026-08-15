@@ -551,10 +551,12 @@ def chunked_prefill_paged_decode(
     num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv),
                                     16)
 
+    # vLLM 0.9.x added kv_cache_dtype to this predicate.
     use_custom = use_rocm_custom_paged_attention(query.dtype, head_size,
                                                  block_size,
                                                  num_queries_per_kv,
-                                                 max_seq_len, sliding_window)
+                                                 max_seq_len, sliding_window,
+                                                 kv_cache_dtype)
     
     if use_custom:
         raise NotImplementedError("Custom paged attention is not implemented")
