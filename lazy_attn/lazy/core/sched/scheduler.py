@@ -23,6 +23,8 @@ from vllm.v1.core.encoder_cache_manager import (EncoderCacheManager,
                                                 compute_encoder_budget)
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.sched.interface import SchedulerInterface
+from vllm.v1.core.sched.request_queue import (SchedulingPolicy,
+                                              create_request_queue)
 from vllm.v1.core.sched.output import (CachedRequestData, NewRequestData,
                                        SchedulerOutput)
 from vllm.v1.core.sched.utils import check_stop
@@ -81,104 +83,32 @@ class LazyScheduler(Scheduler):
         log_stats: bool = False,
     ) -> None:
         logger.info("Initializing LazyScheduler")
-        self.vllm_config = vllm_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.cache_config = vllm_config.cache_config
-        self.lora_config = vllm_config.lora_config
-        self.kv_cache_config = kv_cache_config
-        self.log_stats = log_stats
-        self.structured_output_manager = structured_output_manager
-
-        # include_finished_set controls whether a separate set of finished
-        # request ids should be included in the EngineCoreOutputs returned
-        # by update_from_outputs(). This is currently used in the multi-engine
-        # case to track request lifetimes efficiently.
-        self.include_finished_set = include_finished_set
-
-        # Scheduling constraints.
-        self.max_num_running_reqs = self.scheduler_config.max_num_seqs
-        self.max_num_scheduled_tokens = \
-            self.scheduler_config.max_num_batched_tokens
-        self.max_model_len = self.scheduler_config.max_model_len
-
-        # Create KVConnector for the Scheduler. Note that each Worker
-        # will have a corresponding KVConnector with Role=WORKER.
-        # KV Connector pushes/pull of remote KVs for P/D and offloading.
-        self.connector = None
-        if self.vllm_config.kv_transfer_config is not None:
-            self.connector = KVConnectorFactory.create_connector_v1(
-                config=self.vllm_config, role=KVConnectorRole.SCHEDULER)
-
-        num_gpu_blocks = self.cache_config.num_gpu_blocks
-        assert num_gpu_blocks is not None and num_gpu_blocks > 0
+        # Delegate to the upstream Scheduler rather than re-copying its
+        # __init__. The only lazy-specific piece of setup is swapping in a
+        # KV cache manager that can resolve prefix hits per document, so
+        # everything else stays in sync with vLLM automatically.
+        super().__init__(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=structured_output_manager,
+            mm_registry=mm_registry,
+            include_finished_set=include_finished_set,
+            log_stats=log_stats,
+        )
 
         self.block_size = self.cache_config.block_size
 
-        # req_id -> Request
-        self.requests: dict[str, Request] = {}
-        # Priority queues for requests.
-        self.waiting: deque[Request] = deque()
-        self.running: list[Request] = []
-
-        # The request IDs that are finished in between the previous and the
-        # current steps. This is used to notify the workers about the finished
-        # requests so that they can free the cached states for those requests.
-        # This is flushed at the end of each scheduling step.
-        self.finished_req_ids: set[str] = set()
-
-        # OPTIMIZATION: Cache the CachedRequestData objects to avoid creating
-        # them at each scheduling step.
-        # Request id -> deque of CachedRequestData
-        self._cached_reqs_data: dict[
-            str, deque[CachedRequestData]] = defaultdict(deque)
-
-        # Encoder-related.
-        # Calculate encoder cache size if applicable
-        # NOTE: For now we use the same budget for both compute and space.
-        # This can be changed when we make encoder cache for embedding caching
-        # across requests.
-        encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
-            model_config=vllm_config.model_config,
-            scheduler_config=vllm_config.scheduler_config,
-            mm_registry=mm_registry,
-        )
-
-        # NOTE(woosuk): Here, "encoder" includes the vision encoder (and
-        # projector if needed). Currently, we assume that the encoder also
-        # has the Transformer architecture (e.g., ViT).
-        self.max_num_encoder_input_tokens = encoder_compute_budget
-        # NOTE: For the models without encoder (e.g., text-only models),
-        # the encoder cache will not be initialized because cache size is 0
-        # for these models.
-        self.encoder_cache_manager = EncoderCacheManager(
-            cache_size=encoder_cache_size)
-
-        speculative_config = vllm_config.speculative_config
-
-        self.use_eagle = False
-        self.num_spec_tokens = self.num_lookahead_tokens = 0
-        if speculative_config:
-            self.num_spec_tokens = speculative_config.num_speculative_tokens
-            if speculative_config.use_eagle():
-                self.use_eagle = True
-                self.num_lookahead_tokens = self.num_spec_tokens
-
-        # Create the KV cache manager.
         self.kv_cache_manager = LazyKVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             enable_caching=self.cache_config.enable_prefix_caching,
             caching_hash_algo=self.cache_config.prefix_caching_hash_algo,
             use_eagle=self.use_eagle,
-            log_stats=self.log_stats)
-        
-        # NOTE(Haocheng) 
-        # Hyperparameters for scheduling. can affect the throughput.
-        # - Maximum number of tokens to be processed in a single iteration.
-        # - max_num_batched_tokens: int = field(default=None)  # type: ignore
-        # - Maximum number of sequences to be processed in a single iteration.
-        # e.g., max_num_seqs: int = 128
-        logger.info(f"LazyScheduler launched")
+            log_stats=self.log_stats,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+        )
+
+        logger.info("LazyScheduler launched")
 
     def schedule(self) -> SchedulerOutput:
         schedule_start = time.perf_counter() if LAZY_SHARED_KV_PROFILE else 0.0
@@ -210,7 +140,7 @@ class LazyScheduler(Scheduler):
         # uses structured decoding.
         structured_output_request_ids: dict[str, int] = {}
 
-        req_to_new_block_ids: dict[str, list[int]] = {}
+        req_to_new_block_ids: dict[str, tuple[list[int], ...]] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
@@ -295,7 +225,7 @@ class LazyScheduler(Scheduler):
                         preempted_req.record_event(
                             EngineCoreEventType.PREEMPTED, scheduled_timestamp)
 
-                    self.waiting.appendleft(preempted_req)
+                    self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt.
@@ -317,9 +247,8 @@ class LazyScheduler(Scheduler):
                 # Therefore, we might introduce some additional
                 # cycle to fill in the bitmask, which could be a big no-op.
                 structured_output_request_ids[request.request_id] = req_index
-            req_to_new_block_ids[request.request_id] = [
-                b.block_id for b in new_blocks
-            ]
+            req_to_new_block_ids[request.request_id] = (
+                new_blocks.get_block_ids())
             num_scheduled_tokens[request.request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -352,9 +281,9 @@ class LazyScheduler(Scheduler):
                 if req.lora_request and req.lora_request.lora_int_id > 0)
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Use a temporary deque to collect requests that need to be skipped
-        # and put back at the head of the waiting queue later
-        skipped_waiting_requests: deque[Request] = deque()
+        # Use a temporary RequestQueue to collect requests that need to be
+        # skipped and put back at the head of the waiting queue later
+        skipped_waiting_requests = create_request_queue(self.policy)
 
         # ///////////////////////////////////////////////////////////////////////
         # Next, schedule the WAITING requests.
@@ -365,7 +294,20 @@ class LazyScheduler(Scheduler):
                 if len(self.running) == self.max_num_running_reqs:
                     break
 
-                request = self.waiting[0]
+                request = self.waiting.peek_request()
+
+                # KVTransfer: skip request if still waiting for remote kvs.
+                if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                    is_ready = self._update_waiting_for_remote_kv(request)
+                    if is_ready:
+                        request.status = RequestStatus.WAITING
+                    else:
+                        logger.debug(
+                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
+                            request.request_id)
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                 # Skip request if the structured output request is still waiting
                 # for FSM compilation.
@@ -374,8 +316,8 @@ class LazyScheduler(Scheduler):
                     if structured_output_req and structured_output_req.grammar:
                         request.status = RequestStatus.WAITING
                     else:
-                        self.waiting.popleft()
-                        skipped_waiting_requests.appendleft(request)
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
                         continue
 
                 # Check that adding the request still respects the max_loras
@@ -385,8 +327,8 @@ class LazyScheduler(Scheduler):
                         and request.lora_request.lora_int_id
                         not in scheduled_loras):
                     # Scheduling would exceed max_loras, skip.
-                    self.waiting.popleft()
-                    skipped_waiting_requests.appendleft(request)
+                    self.waiting.pop_request()
+                    skipped_waiting_requests.prepend_request(request)
                     continue
 
                 # NOTE(Haocheng): check doc for lazy attention
@@ -404,19 +346,32 @@ class LazyScheduler(Scheduler):
                                 self.add_doc_request(doc_idx, request)
                         continue
 
+                num_external_computed_tokens = 0
+                load_kv_async = False
+
                 # Get already-cached tokens.
-                computed_blocks, num_computed_tokens = \
-                    self.kv_cache_manager.get_computed_blocks(
-                        request)
+                if request.num_computed_tokens == 0:
+                    # Get locally-cached tokens.
+                    new_computed_blocks, num_new_local_computed_tokens = \
+                        self.kv_cache_manager.get_computed_blocks(
+                            request)
 
-                # Get externally-cached tokens if using a KVConnector.
-                num_external_tokens = (
-                    0 if self.connector is None else
-                    self.connector.get_num_new_matched_tokens(
-                        request, num_computed_tokens))
+                    # Get externally-cached tokens if using a KVConnector.
+                    if self.connector is not None:
+                        num_external_computed_tokens, load_kv_async = (
+                            self.connector.get_num_new_matched_tokens(
+                                request, num_new_local_computed_tokens))
 
-                # Total computed tokens (local + external).
-                num_computed_tokens += num_external_tokens
+                    # Total computed tokens (local + external).
+                    num_computed_tokens = (num_new_local_computed_tokens +
+                                           num_external_computed_tokens)
+                # KVTransfer: WAITING reqs have num_computed_tokens > 0
+                # after async KV recvs are completed.
+                else:
+                    new_computed_blocks = (
+                        self.kv_cache_manager.create_empty_block_list())
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = request.num_computed_tokens
 
                 # NOTE(Haocheng): if one request reach here, there are three cases,
                 # 1. it does not have documents
@@ -428,7 +383,7 @@ class LazyScheduler(Scheduler):
                 # fastening Case 1.1
                 if request.is_document_request and \
                     num_computed_tokens == request.num_tokens:
-                    self.waiting.popleft()
+                    self.waiting.pop_request()
                     continue
 
                 # NOTE(haocheng): new block is allocated, then we assemble
@@ -453,8 +408,13 @@ class LazyScheduler(Scheduler):
                             request,
                             drop_first_cached_block=drop_first_cached_block,
                         )
-                    computed_blocks = list(chain.from_iterable(
-                        computed_blocks_docs)) + computed_blocks
+                    # The documents sit in front of the query in the merged
+                    # prompt, so their cached blocks are prepended (in document
+                    # order) to the query's own hit. KVCacheBlocks.__add__
+                    # concatenates group-wise, which is what the multi-group
+                    # block layout in vLLM 0.9.x expects.
+                    for doc_blocks in reversed(computed_blocks_docs):
+                        new_computed_blocks = doc_blocks + new_computed_blocks
                     expected_doc_tokens = sum(request.document_lens_padded)
                     if not drop_first_cached_block:
                         assert sum(num_computed_tokens_docs) == expected_doc_tokens, (
@@ -468,6 +428,11 @@ class LazyScheduler(Scheduler):
                             expected_doc_tokens,
                         )
                     num_computed_tokens += sum(num_computed_tokens_docs)
+                    # allocate_slots() is told how many of the computed tokens
+                    # are *newly* hit locally, so the document hits must be
+                    # counted there too.
+                    num_new_local_computed_tokens += sum(
+                        num_computed_tokens_docs)
                     logger.debug(f"After merging documents, "
                                  f"request {request.request_id} has "
                                  f"{num_computed_tokens} computed tokens.")
@@ -520,9 +485,11 @@ class LazyScheduler(Scheduler):
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
-                    num_new_tokens + num_external_tokens,
-                    computed_blocks, # will be touched in allocate_slots
+                    num_new_tokens + num_external_computed_tokens,
+                    num_new_local_computed_tokens,
+                    new_computed_blocks,  # will be touched in allocate_slots
                     num_lookahead_tokens=self.num_lookahead_tokens,
+                    delay_cache_blocks=load_kv_async,
                 )
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -534,10 +501,11 @@ class LazyScheduler(Scheduler):
                 if self.connector is not None:
                     self.connector.update_state_after_alloc(
                         request,
-                        num_external_tokens,
+                        new_computed_blocks + new_blocks,
+                        num_external_computed_tokens,
                     )
 
-                self.waiting.popleft()
+                self.waiting.pop_request()
                 if request.use_structured_output:
                     structured_output_request_ids[
                         request.request_id] = req_index
@@ -556,9 +524,8 @@ class LazyScheduler(Scheduler):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
-                req_to_new_block_ids[request.request_id] = [
-                    b.block_id for b in computed_blocks + new_blocks
-                ]
+                req_to_new_block_ids[request.request_id] = (
+                    self.kv_cache_manager.get_block_ids(request.request_id))
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
@@ -575,7 +542,7 @@ class LazyScheduler(Scheduler):
 
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
-            self.waiting.extendleft(skipped_waiting_requests)
+            self.waiting.prepend_requests(skipped_waiting_requests)
 
         # ///////////////////////////////////////////////////////////////////////
         # Check if the scheduling constraints are satisfied.
@@ -614,27 +581,19 @@ class LazyScheduler(Scheduler):
             )
             for req in scheduled_new_reqs
         ]
-        resumed_reqs_data = [
-            self._make_cached_request_data(
-                req,
-                num_scheduled_tokens[req.request_id],
-                len(scheduled_spec_decode_tokens.get(req.request_id, ())),
-                req_to_new_block_ids[req.request_id],
-                resumed_from_preemption=True,
-            ) for req in scheduled_resumed_reqs
-        ]
-        running_reqs_data = [
-            self._make_cached_request_data(
-                req,
-                num_scheduled_tokens[req.request_id],
-                len(scheduled_spec_decode_tokens.get(req.request_id, ())),
-                req_to_new_block_ids[req.request_id],
-                resumed_from_preemption=False,
-            ) for req in scheduled_running_reqs
-        ]
+        # Since 0.9.x the cached requests are sent as a single batched
+        # CachedRequestData rather than one object per request; reuse the base
+        # helper so the batching stays in sync with vLLM.
+        cached_reqs_data = self._make_cached_request_data(
+            scheduled_running_reqs,
+            scheduled_resumed_reqs,
+            num_scheduled_tokens,
+            scheduled_spec_decode_tokens,
+            req_to_new_block_ids,
+        )
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
-            scheduled_cached_reqs=resumed_reqs_data + running_reqs_data,
+            scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
@@ -701,9 +660,9 @@ class LazyScheduler(Scheduler):
             tag = "[Lazy]"
         logger.debug(f"Adding {tag} request {request.request_id} to LazyScheduler")
         if left:
-            self.waiting.appendleft(request)
+            self.waiting.prepend_request(request)
         else:
-            self.waiting.append(request)
+            self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED)
