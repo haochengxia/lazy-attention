@@ -4,15 +4,15 @@ from itertools import chain
 
 import pytest
 
+from conftest import make_lazy_request
 from lazy.core.sched.scheduler import (metadata_for_lazy_attention,
                                        metadata_for_mepic)
-from lazy.request import LazyRequest
 
 BLOCK_SIZE = 8
 
 # Four documents, right-padded to a whole number of blocks. The padding is what
 # the rotation metadata has to account for: real lengths [6, 15, 8, 2] padded
-# to [8, 16, 8, 8].
+# to [8, 16, 8, 8], i.e. 5 document blocks in total.
 DOCUMENTS_TOKEN_IDS_PADDED = [
     [1, 2, 3, 4, 5, 6, 128001, 128001],
     [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 128001],
@@ -25,17 +25,8 @@ DOCUMENT_LENS_PADDED = [8, 16, 8, 8]
 
 @pytest.fixture
 def mock_request():
-    from vllm import SamplingParams
-
-    return LazyRequest(
-        request_id="test_request",
-        prompt_token_ids=[1, 2, 3, 4],
-        multi_modal_inputs=None,
-        multi_modal_hashes=None,
-        multi_modal_placeholders=None,
-        sampling_params=SamplingParams(max_tokens=1),
+    return make_lazy_request(
         eos_token_id=128001,
-        arrival_time=0.0,
         documents_token_ids_padded=DOCUMENTS_TOKEN_IDS_PADDED,
         document_lens=DOCUMENT_LENS,
         document_lens_padded=DOCUMENT_LENS_PADDED,
@@ -46,35 +37,15 @@ def mock_request():
 def test_metadata_for_lazy_attention(mock_request):
     q_offset, q_mask = metadata_for_lazy_attention(mock_request, BLOCK_SIZE)
 
-    num_doc_blocks = sum(DOCUMENT_LENS_PADDED) // BLOCK_SIZE
     # One entry per document block, plus one for the query/decode block.
-    assert len(q_offset) == len(q_mask) == num_doc_blocks + 1
-
-    # Every block of a document carries the same rotation offset, biased by +1
-    # so that 0 stays free as a sentinel. The offset of document i is the total
-    # padding ahead of it plus the real length of every earlier document --
-    # i.e. how far the document has to rotate to sit where the unpadded
-    # concatenation would have put it.
-    total_padding = sum(p - l
-                        for p, l in zip(DOCUMENT_LENS_PADDED, DOCUMENT_LENS))
-    expected_offset = []
-    expected_mask = []
-    rot = total_padding
-    for doc_idx, padded_len in enumerate(DOCUMENT_LENS_PADDED):
-        blocks = padded_len // BLOCK_SIZE
-        expected_offset += [rot + 1] * blocks
-        # Only the last block of a document is partially padded.
-        expected_mask += [0] * (blocks - 1)
-        expected_mask += [padded_len - DOCUMENT_LENS[doc_idx]]
-        rot += DOCUMENT_LENS[doc_idx]
-    # The query block keeps the original global RoPE orientation.
-    expected_offset.append(1)
-    expected_mask.append(0)
-
-    assert q_offset == expected_offset
-    assert q_mask == expected_mask
-    # Pinned so a change in the encoding is visible rather than silently
-    # tracked by the formula above.
+    #
+    # q_offset: every block of a document repeats that document's rotation
+    # offset, biased by +1 so 0 stays free as a sentinel. Document i rotates by
+    # the total padding (9) plus the real length of every earlier document:
+    #   doc0 -> 9,  doc1 -> 9+6=15,  doc2 -> 15+15=30,  doc3 -> 30+8=38
+    # and the trailing 1 resets the query block to the global RoPE orientation.
+    #
+    # q_mask: the padding of each document, recorded on its last block only.
     assert q_offset == [10, 16, 16, 31, 39, 1]
     assert q_mask == [2, 0, 1, 0, 6, 0]
 
@@ -99,3 +70,21 @@ def test_documents_merge_in_front_of_the_prompt(mock_request):
         list(chain.from_iterable(DOCUMENTS_TOKEN_IDS_PADDED)) + query_tokens)
     assert mock_request.num_prompt_tokens == len(mock_request.prompt_token_ids)
     assert list(mock_request.all_token_ids) == mock_request.prompt_token_ids
+
+
+@pytest.mark.unit
+def test_document_request_carries_the_hashing_fields(mock_request):
+    mock_request.cache_salt = "tenant-a"
+    mock_request.sampling_params.max_tokens = 64
+    doc = mock_request.document_request(1)
+
+    assert doc.request_id == f"{mock_request.request_id}_d1"
+    assert doc.prompt_token_ids == DOCUMENTS_TOKEN_IDS_PADDED[1]
+    assert doc.is_document_request
+    # Everything that feeds a block hash has to match the parent, or the
+    # parent can never find the blocks this request writes.
+    assert doc.cache_salt == "tenant-a"
+    # A document is prefill-only; it never samples. The parent's own params
+    # must survive that -- they are shared until deep-copied.
+    assert doc.sampling_params.max_tokens == 1
+    assert mock_request.sampling_params.max_tokens == 64

@@ -41,7 +41,6 @@ logger = init_logger(__name__)
 
 # Additional import for lazy attention
 from itertools import chain
-import copy
 import numpy as np
 from vllm.utils import cdiv, sha256
 
@@ -52,6 +51,7 @@ from lazy.request import LazyRequest as Request
 from lazy.engine import EngineCoreRequest, EngineCoreEventType
 from lazy.core.sched.output import NewRequestData
 from lazy.utils.variants import (get_lazy_attention_variant_code,
+                                 is_mepic_variant,
                                  lazy_shared_kv_profile_enabled,
                                  lazy_shared_kv_profile_min_reqs,
                                  mepic_first_block_recompute_enabled)
@@ -67,6 +67,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 # in the same time.
 
 LAZY_ATTENTION_VARIANT = get_lazy_attention_variant_code()
+IS_MEPIC = is_mepic_variant()
 MEPIC_FIRST_BLOCK_RECOMPUTE = mepic_first_block_recompute_enabled()
 LAZY_SHARED_KV_PROFILE = lazy_shared_kv_profile_enabled()
 LAZY_SHARED_KV_PROFILE_MIN_REQS = lazy_shared_kv_profile_min_reqs()
@@ -408,8 +409,7 @@ class LazyScheduler(Scheduler):
                                  f"{request.num_prompt_tokens}")
 
                     drop_first_cached_block = (
-                        LAZY_ATTENTION_VARIANT == 2
-                        and MEPIC_FIRST_BLOCK_RECOMPUTE
+                        IS_MEPIC and MEPIC_FIRST_BLOCK_RECOMPUTE
                     )
                     computed_blocks_docs, num_computed_tokens_docs = \
                         self.kv_cache_manager.get_computed_blocks_docs(
@@ -690,63 +690,7 @@ class LazyScheduler(Scheduler):
                      f"hash {sha256(tuple(request.documents_token_ids_padded[doc_idx]))}")
         # NOTE(haocheng): new spawned doc has higher priority than other
         # waiting reqs, since it is blocking the query request.
-        self.add_request(build_document_request(request, doc_idx), left=True)
-
-def metadata_for_lazy_attention_old(request: Request, block_size: int) -> tuple[list[int], list[int]]:
-    """Generate the metadata for lazy attention."""
-    num_docs = len(request.document_lens)
-    # Number of blocks for docs + 1 (for query)
-    num_blocks = sum(request.document_lens_padded) // block_size + 1
-    q_mask = np.zeros(num_blocks, dtype=np.int32)
-    q_offset = np.zeros(num_blocks, dtype=np.int32)
-    cursor = 0
-    # First doc
-    padding_lens = np.array(request.document_lens_padded) - \
-                   np.array(request.document_lens)
-    num_blk_doc = request.document_lens_padded[0] // block_size
-    q_offset[0] = -sum(padding_lens)
-    cursor += num_blk_doc
-    q_mask[cursor - 1] = padding_lens[0]
-
-    # Process other docs
-    for doc_idx in range(1, num_docs):
-        num_blk_doc = request.document_lens_padded[doc_idx] // block_size
-        q_offset[cursor] = -request.document_lens[doc_idx-1]
-        cursor += num_blk_doc
-        q_mask[cursor-1] = padding_lens[doc_idx]
-    
-    q_offset[cursor] = sum(request.document_lens_padded) - request.document_lens[-1]
-    return list(q_offset), list(q_mask)
-
-
-def build_document_request(request: Request, doc_idx: int) -> Request:
-    """The request that populates one document's KV blocks.
-
-    It only ever prefills: the blocks it writes are what the parent request
-    later finds via `hash_request_tokens_docs`, so everything that feeds a
-    block hash has to line up between the two.
-
-    - `cache_salt` is forwarded, because the per-document hashes include it.
-    - `lora_request` is deliberately *not*. Upstream folds the LoRA id into
-      every block's extra keys while the per-document hashes do not, so a LoRA
-      document request would populate blocks the parent can never match --
-      leaving `is_doc_ready` false forever. Documents + LoRA is unsupported.
-    """
-    sampling_params = copy.deepcopy(request.sampling_params)
-    sampling_params.max_tokens = 1  # TODO(haocheng): how to avoid
-    return Request(
-        request_id=f"{request.request_id}_d{doc_idx}",
-        prompt_token_ids=request.documents_token_ids_padded[doc_idx],
-        multi_modal_inputs=request.mm_inputs,
-        multi_modal_hashes=request.mm_hashes,
-        multi_modal_placeholders=request.mm_positions,
-        sampling_params=sampling_params,
-        eos_token_id=request.eos_token_id,
-        is_document_request=True,
-        arrival_time=request.arrival_time,
-        cache_salt=request.cache_salt,
-    )
-
+        self.add_request(request.document_request(doc_idx), left=True)
 
 def metadata_for_lazy_attention(request: Request, block_size: int) -> tuple[list[int], list[int]]:
     """Generate the metadata for lazy attention."""
@@ -782,7 +726,7 @@ def metadata_for_mepic(request: Request,
 
 def metadata_for_variant(request: Request,
                          block_size: int) -> tuple[list[int], list[int]]:
-    if LAZY_ATTENTION_VARIANT == 2:
+    if IS_MEPIC:
         return metadata_for_mepic(request, block_size)
     return metadata_for_lazy_attention(request, block_size)
 

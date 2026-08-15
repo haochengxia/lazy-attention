@@ -68,6 +68,28 @@ def test_lazy_request_covers_vllm_request():
 
 
 @pytest.mark.unit
+def test_pooling_request_has_no_structured_output():
+    """Pooling requests carry no sampling_params, and the scheduler still asks
+    every request whether it uses structured output."""
+    from vllm.pooling_params import PoolingParams
+
+    from lazy.request import LazyRequest
+
+    request = LazyRequest(
+        request_id="pool",
+        prompt_token_ids=[1, 2, 3],
+        multi_modal_inputs=None,
+        multi_modal_hashes=None,
+        multi_modal_placeholders=None,
+        sampling_params=None,
+        pooling_params=PoolingParams(),
+        eos_token_id=None,
+        arrival_time=0.0,
+    )
+    assert request.use_structured_output is False
+
+
+@pytest.mark.unit
 def test_engine_core_request_covers_vllm_fields():
     """The lazy EngineCoreRequest must carry every upstream field."""
     vllm_ecr = _original("vllm.v1.engine.EngineCoreRequest")

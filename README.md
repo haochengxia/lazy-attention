@@ -60,8 +60,16 @@ consumer GPU. Set `LAZY_TEST_MODEL=ldsjmdy/Tulu3-Block-FT` to reproduce the
 paper's 8B accuracy numbers.
 
 Three kernel/utility modules import helpers from vLLM's own `tests.*` package,
-which the wheel does not ship; they are skipped automatically (with a warning
-naming each one) unless you are running against a vLLM source checkout.
+which the wheel does not ship. They report as skipped, with the reason, unless
+you are running against a vLLM source checkout.
+
+### Variants
+
+`LAZY_ATTENTION_VARIANT=lazy|mepic` selects the attention implementation
+(default `lazy`). That one variable picks the kernel set, the RoPE behaviour
+and the scheduler's rotation metadata together;
+[lazy/utils/variants.py](./lazy_attn/lazy/utils/variants.py) documents it and
+every tuning/profiling switch in one place.
 
 ## Demo: Lazy-Attn vs Prefix Caching
 

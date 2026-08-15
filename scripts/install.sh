@@ -104,29 +104,29 @@ if [[ ${CHECK_ONLY} -eq 1 ]]; then
 fi
 
 # -------------------------------------------------------------- vllm ----
-if [[ ${FROM_SOURCE} -eq 1 ]]; then
-    # vllm_proj/install.sh requires torch to already be importable (vLLM's
-    # setup.py reads torch to configure the CUDA build), so a fresh
-    # virtualenv has to be seeded first -- otherwise the source path dies at
-    # its prerequisite check before cloning anything.
-    say "Installing build prerequisites (torch ${TORCH_VERSION}+${TORCH_CUDA})"
+# The pinned torch lives on PyTorch's own index; everything else on PyPI.
+pip_pinned() {
     pip install \
         --index-url "${TORCH_INDEX}" \
         --extra-index-url https://pypi.org/simple \
         "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
-        "transformers==${TRANSFORMERS_VERSION}"
-    pip install cmake ninja setuptools_scm
+        "transformers==${TRANSFORMERS_VERSION}" \
+        "$@"
+}
+
+if [[ ${FROM_SOURCE} -eq 1 ]]; then
+    # vllm_proj/install.sh needs torch importable and cmake/ninja on PATH
+    # before it starts -- vLLM's setup.py reads torch to configure the CUDA
+    # build. Without this a fresh virtualenv dies at that prerequisite check,
+    # before cloning anything.
+    say "Installing build prerequisites (torch ${TORCH_VERSION}+${TORCH_CUDA})"
+    pip_pinned cmake ninja
 
     say "Building vLLM from source (20-60 min)"
     bash "${REPO_ROOT}/vllm_proj/install.sh"
 else
     say "Installing vLLM ${VLLM_VERSION} with torch ${TORCH_VERSION}+${TORCH_CUDA}"
-    pip install \
-        --index-url "${TORCH_INDEX}" \
-        --extra-index-url https://pypi.org/simple \
-        "vllm==${VLLM_VERSION}" \
-        "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
-        "transformers==${TRANSFORMERS_VERSION}"
+    pip_pinned "vllm==${VLLM_VERSION}"
 fi
 
 if [[ ${NEEDS_SM120} -eq 1 ]]; then

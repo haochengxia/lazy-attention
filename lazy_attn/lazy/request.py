@@ -4,6 +4,7 @@ Request class for LazyAttention.
 This class is a wrapper around the original Request class from vllm. 
 """
 
+import copy
 import enum
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -184,6 +185,36 @@ class LazyRequest:
     @property
     def has_documents(self) -> bool:
         return self.documents_token_ids_padded is not None
+
+    def document_request(self, doc_idx: int) -> "LazyRequest":
+        """The request that populates one document's KV blocks.
+
+        It only ever prefills. The blocks it writes are the ones this request
+        later looks up, so both sides hash the *same object* -- salt, and
+        anything vLLM adds to the block hash later, line up by construction
+        rather than by two code paths agreeing.
+
+        `lora_request` is deliberately not forwarded: upstream folds the LoRA
+        id into every block's extra keys, and the parent's own hashes carry the
+        parent's id, so a LoRA document would populate blocks the parent could
+        never match -- leaving `is_doc_ready` false forever. Documents + LoRA
+        is unsupported.
+        """
+        assert self.has_documents
+        sampling_params = copy.deepcopy(self.sampling_params)
+        sampling_params.max_tokens = 1  # TODO(haocheng): how to avoid
+        return LazyRequest(
+            request_id=f"{self.request_id}_d{doc_idx}",
+            prompt_token_ids=self.documents_token_ids_padded[doc_idx],
+            multi_modal_inputs=self.mm_inputs,
+            multi_modal_hashes=self.mm_hashes,
+            multi_modal_placeholders=self.mm_positions,
+            sampling_params=sampling_params,
+            eos_token_id=self.eos_token_id,
+            arrival_time=self.arrival_time,
+            cache_salt=self.cache_salt,
+            is_document_request=True,
+        )
 
     @property
     def num_tokens(self) -> int:

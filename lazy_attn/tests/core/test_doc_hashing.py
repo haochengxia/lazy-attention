@@ -3,44 +3,30 @@
 The lazy paths hash documents outside vLLM's `hash_request_tokens`, so the
 properties upstream gets for free -- cache-salt isolation, and agreement
 between the hash a parent computes for a document and the hash the spawned
-document request writes -- have to be checked here.
+document request writes -- are checked here.
 """
-from __future__ import annotations
-
 import pytest
-
-import lazy.__vllm__  # noqa: F401  applies the patches
 
 from vllm.utils import sha256
 from vllm.v1.core.kv_cache_utils import hash_request_tokens
 
+from conftest import make_lazy_request
 from lazy.core.kv_cache_utils import (hash_request_tokens_docs,
                                       hash_request_tokens_with_doc_hash)
-from lazy.core.sched.scheduler import build_document_request
-from lazy.request import LazyRequest
 
 BLOCK_SIZE = 4
 DOCUMENTS = [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12]]
 
 
-def make_request(cache_salt=None, request_id="r0"):
-    from vllm import SamplingParams
-
-    return LazyRequest(
-        request_id=request_id,
-        prompt_token_ids=[100, 101, 102, 103],
-        multi_modal_inputs=None,
-        multi_modal_hashes=None,
-        multi_modal_placeholders=None,
-        sampling_params=SamplingParams(max_tokens=1),
-        eos_token_id=None,
-        arrival_time=0.0,
-        cache_salt=cache_salt,
+def make_request(**overrides):
+    kwargs = dict(
         documents_token_ids_padded=DOCUMENTS,
         document_lens=[len(d) for d in DOCUMENTS],
         document_lens_padded=[len(d) for d in DOCUMENTS],
         document_seq_hash="abc123",
     )
+    kwargs.update(overrides)
+    return make_lazy_request(**kwargs)
 
 
 @pytest.mark.unit
@@ -58,9 +44,9 @@ def test_salt_isolates_document_hashes(hash_fn):
         assert salted[doc_idx] != other[doc_idx]
 
     # Same salt, same documents -> same hashes, or nothing is ever reused.
-    again = hash_request_tokens_docs(hash_fn, BLOCK_SIZE,
-                                     make_request(cache_salt="tenant-a",
-                                                  request_id="r1"))
+    again = hash_request_tokens_docs(
+        hash_fn, BLOCK_SIZE,
+        make_request(cache_salt="tenant-a", request_id="other_request"))
     assert again == salted
 
 
@@ -75,11 +61,10 @@ def test_document_hashes_match_the_spawned_request(hash_fn, cache_salt):
     by_parent = hash_request_tokens_docs(hash_fn, BLOCK_SIZE, parent)
 
     for doc_idx in range(len(DOCUMENTS)):
-        # The real spawn path, so a field the scheduler stops forwarding shows
-        # up here as a hash mismatch.
-        doc_request = build_document_request(parent, doc_idx)
-        by_document = hash_request_tokens(hash_fn, BLOCK_SIZE, doc_request)
-        assert by_parent[doc_idx] == by_document
+        # The real spawn path, as the scheduler calls it.
+        doc_request = parent.document_request(doc_idx)
+        assert by_parent[doc_idx] == hash_request_tokens(
+            hash_fn, BLOCK_SIZE, doc_request)
 
 
 @pytest.mark.unit
@@ -97,19 +82,14 @@ def test_salt_isolates_query_hashes(hash_fn):
 
 
 @pytest.mark.unit
-def test_pooling_request_has_no_structured_output():
-    """Pooling requests carry no sampling_params; the scheduler still asks."""
-    from vllm.pooling_params import PoolingParams
+@pytest.mark.parametrize("hash_fn", [sha256, hash])
+def test_query_hashes_are_seeded_by_the_document_sequence(hash_fn):
+    """Two requests with the same query but different documents must not share
+    query blocks -- that seed is the whole point of this hash path."""
+    one = hash_request_tokens_with_doc_hash(hash_fn, BLOCK_SIZE,
+                                            make_request())
+    two = hash_request_tokens_with_doc_hash(
+        hash_fn, BLOCK_SIZE, make_request(document_seq_hash="def456"))
 
-    request = LazyRequest(
-        request_id="pool",
-        prompt_token_ids=[1, 2, 3],
-        multi_modal_inputs=None,
-        multi_modal_hashes=None,
-        multi_modal_placeholders=None,
-        sampling_params=None,
-        pooling_params=PoolingParams(),
-        eos_token_id=None,
-        arrival_time=0.0,
-    )
-    assert request.use_structured_output is False
+    assert one and two
+    assert one != two

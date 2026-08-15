@@ -1,19 +1,21 @@
-"""Smoke-test LazyAttention against a plain-vLLM baseline.
+"""Smoke-test LazyAttention end to end.
 
-Runs the same questions twice -- once with the documents concatenated into the
-prompt (stock vLLM) and once through LazyAttention's `document_seqs` path --
-then re-issues the lazy requests with the documents in a different order,
-which is the case prefix caching cannot reuse but LazyAttention can.
+Runs the same questions three ways -- documents concatenated into the prompt,
+documents through LazyAttention's `document_seqs` path, and the same documents
+in a different order (the case prefix caching cannot reuse but LazyAttention
+can).
 
-Each answer must contain the fact its documents support. That is the check
+Every answer must contain the fact its documents support. That is the check
 that fails when attention or the cache regresses: a broken rotation or a
 mis-addressed block yields fluent text that no longer answers the question.
+The inlined run is held to the same standard -- the patches are global, so it
+is not an independent control, and letting it off would hide the failures that
+break everything at once.
 
-The lazy answer is *not* required to match the baseline token for token. The
-two run different attention patterns by construction -- the baseline sees one
-causal sequence, LazyAttention encodes each document position-agnostically --
-so they routinely agree on the fact and differ in phrasing or length. Any
-difference is printed for inspection.
+The lazy answer is *not* required to match the inlined one token for token.
+They run different attention patterns by construction -- one causal sequence
+versus per-document position-agnostic encoding -- so they routinely agree on
+the fact and differ in phrasing or length. Differences are printed.
 
     python scripts/validate_lazy.py [--model MODEL]
 
@@ -24,14 +26,22 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import NamedTuple
 
 # Patch vLLM before anything imports it.
 import lazy.__vllm__  # noqa: F401  isort:skip
 
 from vllm import LLM, SamplingParams  # noqa: E402
 
+
+class Case(NamedTuple):
+    prompt: str
+    documents: list[str]
+    expected: str  # the fact the documents support; must appear in the answer
+
+
 CASES = [
-    (
+    Case(
         "Question: Which city is the capital of France? Answer:",
         [
             "Paris is the capital and largest city of France.",
@@ -40,7 +50,7 @@ CASES = [
         ],
         "Paris",
     ),
-    (
+    Case(
         "Question: Which city is the capital of Italy? Answer:",
         [
             "Madrid is the capital of Spain.",
@@ -50,6 +60,8 @@ CASES = [
         "Rome",
     ),
 ]
+
+LABELS = ("baseline", "lazy", "reordered")
 
 
 def main() -> int:
@@ -70,58 +82,49 @@ def main() -> int:
         enforce_eager=True,
     )
 
-    prompts = [p for p, _, _ in CASES]
-    docs = [d for _, d, _ in CASES]
+    def answers(prompts, **kwargs) -> list[str]:
+        outputs = llm.generate(prompts=prompts, sampling_params=sampling,
+                               **kwargs)
+        return [o.outputs[0].text for o in outputs]
 
-    # Baseline: documents inlined into the prompt, no lazy path.
-    baseline_prompts = [
-        "\n".join(doc_list) + "\n" + prompt
-        for prompt, doc_list, _ in CASES
-    ]
-    baseline = llm.generate(prompts=baseline_prompts, sampling_params=sampling)
-    baseline_texts = [o.outputs[0].text for o in baseline]
+    prompts = [case.prompt for case in CASES]
+    docs = [case.documents for case in CASES]
 
-    # LazyAttention: documents passed separately.
-    lazy_out = llm.generate(prompts=prompts, sampling_params=sampling,
-                            document_seqs=docs)
-    lazy_texts = [o.outputs[0].text for o in lazy_out]
-
+    baselines = answers(  # documents inlined into the prompt, no lazy path
+        ["\n".join(case.documents) + "\n" + case.prompt for case in CASES])
+    lazy = answers(prompts, document_seqs=docs)
     # Same documents, new order -- the reordering case prefix caching misses.
-    reordered = [list(reversed(doc_list)) for doc_list in docs]
-    reordered_out = llm.generate(prompts=prompts, sampling_params=sampling,
-                                 document_seqs=reordered)
-    reordered_texts = [o.outputs[0].text for o in reordered_out]
+    reordered = answers(prompts,
+                        document_seqs=[list(reversed(d)) for d in docs])
 
     failures = 0
-    for i, (prompt, _, expected) in enumerate(CASES):
-        print(f"\n--- case {i}: {prompt}")
-        print(f"  baseline  : {baseline_texts[i]!r}")
-        print(f"  lazy      : {lazy_texts[i]!r}")
-        print(f"  reordered : {reordered_texts[i]!r}")
+    for i, (case, texts) in enumerate(
+            zip(CASES, zip(baselines, lazy, reordered))):
+        print(f"\n--- case {i}: {case.prompt}")
+        for label, text in zip(LABELS, texts):
+            print(f"  {label:<10}: {text!r}")
 
-        if expected.lower() not in baseline_texts[i].lower():
-            # The baseline is stock vLLM, so this is the model failing the
-            # question, not LazyAttention. Report it rather than blaming the
-            # lazy path for an answer it was never going to get right.
-            print(f"  WARN: baseline itself does not answer {expected!r}; "
-                  "the lazy checks below are not meaningful for this case")
-            continue
-
-        for label, text in (("lazy", lazy_texts[i]),
-                            ("reordered", reordered_texts[i])):
+        # The baseline is checked too, and just as strictly. It does not run
+        # stock vLLM -- the patches are global, so it goes through the same
+        # patched engine with the documents inlined. A broken patch garbles it
+        # as well, and skipping the case when the baseline looks wrong would
+        # turn the loudest possible failure into a pass.
+        for label, text in zip(LABELS, texts):
             if not text.strip():
                 print(f"  FAIL: {label} produced no output")
                 failures += 1
-            elif expected.lower() not in text.lower():
-                print(f"  FAIL: {label} answer does not contain {expected!r} "
-                      "-- the documents did not reach attention intact")
+            elif case.expected.lower() not in text.lower():
+                print(f"  FAIL: {label} answer does not contain "
+                      f"{case.expected!r} -- the documents did not reach "
+                      "attention intact")
                 failures += 1
 
-        if lazy_texts[i] != baseline_texts[i]:
-            # Expected: different attention pattern, same fact. Shown so a
-            # sudden change in wording is at least visible.
+        # Expected: a different attention pattern reaches the same fact by a
+        # different route. Shown so a sudden change in wording is visible.
+        baseline_text, lazy_text, reordered_text = texts
+        if lazy_text != baseline_text:
             print("  note: lazy wording differs from the baseline")
-        if lazy_texts[i] != reordered_texts[i]:
+        if lazy_text != reordered_text:
             print("  note: reordering the documents changed the wording")
 
     print()

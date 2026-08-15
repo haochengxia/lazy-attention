@@ -1,6 +1,11 @@
 import pytest
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.utils import sha256
+pytest.importorskip(
+    "tests.v1.core.test_kv_cache_utils",
+    reason="imports vLLM's own tests.* helpers, which ship only in a "
+           "vLLM source checkout, not in the wheel scripts/install.sh "
+           "installs")
 from tests.v1.core.test_kv_cache_utils import make_request
 
 
