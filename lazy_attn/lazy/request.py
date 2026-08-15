@@ -178,6 +178,10 @@ class LazyRequest:
             self._all_token_ids.extend(token_ids)
             
     @property
+    def is_output_corrupted(self) -> bool:
+        return self.num_nans_in_logits > 0
+
+    @property
     def has_documents(self) -> bool:
         return self.documents_token_ids_padded is not None
 

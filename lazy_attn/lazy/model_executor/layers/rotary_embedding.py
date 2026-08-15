@@ -47,6 +47,34 @@ def _should_use_q_only_rotary() -> bool:
     #     return bool(torch.any(is_lazy).item())
     # return bool(is_lazy)
 
+class LazyRotaryEmbedding(RotaryEmbedding):
+    """Plain RoPE that also exposes `inv_freq` to the lazy attention kernels.
+
+    LazyAttention defers the key rotation into the attention kernel, so the
+    model's forward hands `self.rotary_emb.inv_freq` down to it. vLLM's base
+    RotaryEmbedding only keeps the derived `cos_sin_cache`, so the frequencies
+    have to be materialised here.
+
+    This matters for any Llama checkpoint with `rope_scaling: null` -- notably
+    the block-fine-tuned models used in the paper -- where vLLM builds this
+    class instead of Llama3RotaryEmbedding.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(head_size, rotary_dim, max_position_embeddings, base,
+                         is_neox_style, dtype)
+        inv_freq = self._compute_inv_freq(base).to(torch.bfloat16)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+
 class Llama3RotaryEmbedding(RotaryEmbedding):
 
     def __init__(
