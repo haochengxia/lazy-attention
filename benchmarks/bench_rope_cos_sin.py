@@ -21,6 +21,12 @@ What is controlled for:
   the same context in one piece.
 * **Compile-time effects.** `n_regs` / `n_spills` are read off each compiled
   kernel, since the standing explanation for the default is occupancy.
+* **Which kernel, and which RoPE.** Both are constexpr specializations with
+  their own register budgets, so both are swept: the mixed decode kernel and
+  the lazy-only one `LAZY_FORCE_SPLIT_DECODE` selects, each with Llama-3
+  smoothed RoPE and with plain RoPE (`ROPE_TYPE=0`, which compiles the
+  smoothing out). The project's own checkpoints use both -- the 1B Block-FT
+  model has no `rope_scaling` at all, the 8B one does.
 
 Correctness is checked too: the two paths must agree, or the faster one is
 irrelevant.
@@ -30,11 +36,13 @@ irrelevant.
     python benchmarks/bench_rope_cos_sin.py --json out.json
     python benchmarks/bench_rope_cos_sin.py --e2e         # model-level A/B
 
-What it found (RTX 5070 Ti, sm_120, torch 2.7.0+cu128 / triton 3.4.0): compute
-loses 36/36 sweep cases, median 1.10x, and wins only for large-batch decode at
-head_size=128 (0.88x at 128 seqs), where the load path is itself register-bound
-so the swap buys occupancy. Hence LOAD stays the default. docs/design.md 4.3.1
-has the register and PTX numbers behind that.
+What it found (RTX 5070 Ti, sm_120, torch 2.7.0+cu128 / triton 3.4.0): over the
+144 sweep cases (1-32 seqs x both kernels x both RoPE types) 105 separated and
+compute lost every one of them, median 1.11x; the other 39 are reported as
+inconclusive, not as wins. Compute turns a profit only for large-batch decode
+at head_size=128 (0.89x at 128 seqs), where the load path is itself
+register-bound so the swap buys occupancy. Hence LOAD stays the default.
+docs/design.md 4.3.1 has the register and PTX numbers behind that.
 """
 from __future__ import annotations
 
@@ -48,11 +56,24 @@ from types import SimpleNamespace
 import torch
 import triton
 
-from vllm.model_executor.layers.rotary_embedding import Llama3RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding import (Llama3RotaryEmbedding,
+                                                         RotaryEmbedding)
 
-from lazy.attention.ops.models.llama_v1 import kernel_paged_attention_2d_llama
+from lazy.attention.ops.models.llama_v1 import (
+    kernel_paged_attention_2d_llama, kernel_paged_attention_2d_llama_lazy_only)
 from lazy.core.sched.scheduler import metadata_for_lazy_attention
 from lazy.model_executor.rope import rope_meta_from_layer
+
+# Both decode kernels the runner can pick. They share a signature and a cos/sin
+# path; the lazy-only one drops the non-lazy branch, which is what
+# `LAZY_FORCE_SPLIT_DECODE=1` selects when a batch is split so that every
+# sequence in this launch is lazy. Fewer live values means a different register
+# budget, so its LOAD-vs-COMPUTE trade-off is a separate measurement.
+KERNELS = {
+    "mixed": kernel_paged_attention_2d_llama,
+    "lazy_only": kernel_paged_attention_2d_llama_lazy_only,
+}
+ROPE_KINDS = ["llama3", "plain"]
 
 BLOCK_SIZE = 16
 DTYPE = torch.bfloat16
@@ -110,6 +131,36 @@ MAX_PACKED_Q_OFFSET = 0xFFFF
 # nothing to do with correctness, and dividing by the tensor's peak instead
 # just makes the threshold depend on which random inputs were drawn.
 MAX_ABS_DISAGREEMENT = 0.02
+# Width of the measurement counter in the e2e query template; see
+# `check_query_sets_are_equal_work`.
+MEASUREMENT_DIGITS = 3
+
+
+def padding_plan(num_docs: int, seq_idx: int) -> list[int]:
+    """Per-document padding for one sequence: a fixed multiset, rotated.
+
+    Padding is the mechanism the real metadata has for shifting rotation
+    offsets -- a document's offset is the total padding plus the true lengths
+    ahead of it -- so sequences have to differ in it, or the whole batch reads
+    the same handful of `cos_sin_cache` rows and the load path gets an L2 hit
+    rate no real batch would give it.
+
+    They differ in *where* the padding sits, not in how much there is. Every
+    sequence gets the same multiset, rotated by `seq_idx`, so all of them have
+    the same total true context length, the same block layout, and the same
+    number of rotations; only the offsets move. Scaling one pad value with
+    `seq_idx` instead (the earlier version) changed the true length per
+    sequence, and gave the `pad == 0` rows one rotation fewer than the rest --
+    so a "single document" case was really a mix of zero- and one-rotation
+    sequences, and the per-sequence work varied with the batch index.
+
+    The first entry is non-zero, so the total padding is always at least 1 and
+    the first document always rotates. With one document there is nothing to
+    rotate between, and every sequence necessarily gets the same plan.
+    """
+    base = [(doc_idx * 5 + 1) % BLOCK_SIZE for doc_idx in range(num_docs)]
+    split = seq_idx % num_docs
+    return base[split:] + base[:split]
 
 
 @dataclass
@@ -154,8 +205,25 @@ class Case:
                 f"field holds; the excess bits would land in the block index.")
 
     @property
-    def blocks_per_seq(self) -> int:
+    def doc_blocks_per_seq(self) -> int:
         return self.context_len // BLOCK_SIZE
+
+    @property
+    def blocks_per_seq(self) -> int:
+        """Document blocks plus the query/decode block.
+
+        Production always walks one more block than the documents occupy: the
+        partially filled one holding the query prompt and the tokens generated
+        so far, whose metadata entry is the `q_offset = 1` reset. Dropping it
+        (the earlier version did) skipped a block of the loop, a partial-block
+        mask, and the one offset transition that costs nothing to serve.
+        """
+        return self.doc_blocks_per_seq + 1
+
+    @property
+    def seq_len(self) -> int:
+        """Context plus the token being decoded, which lives in the last block."""
+        return self.context_len + 1
 
     @property
     def num_docs(self) -> int:
@@ -166,14 +234,15 @@ class Case:
         """Largest +1-biased offset this case puts in the packed table.
 
         Mirrors `metadata_for_lazy_attention`: total padding, plus the true
-        lengths of the documents ahead of the last one. `build_inputs` gives
-        sequence `i` a padding of `i % BLOCK_SIZE` per document, so the largest
-        offset is whichever of those pads maximises it.
+        lengths of the documents ahead of the last one, over every padding
+        plan `build_inputs` will use.
         """
-        pads = range(min(self.num_seqs, BLOCK_SIZE))
-        return max(
-            self.num_docs * pad + (self.num_docs - 1) * (self.doc_len - pad) + 1
-            for pad in pads)
+        best = 0
+        for seq_idx in range(min(self.num_seqs, self.num_docs)):
+            pads = padding_plan(self.num_docs, seq_idx)
+            true_lens = [self.doc_len - pad for pad in pads]
+            best = max(best, sum(pads) + sum(true_lens[:-1]) + 1)
+        return best
 
 
 @dataclass
@@ -193,7 +262,7 @@ class Timing:
         return max(self.per_iter_ms)
 
 
-def build_inputs(case: Case, device: torch.device):
+def build_inputs(case: Case, device: torch.device, rope_kind: str = "llama3"):
     """Decode-shaped inputs: one query token per sequence, KV already cached."""
     shape = case.shape
     num_seqs = case.num_seqs
@@ -223,7 +292,7 @@ def build_inputs(case: Case, device: torch.device):
                         device=device)
     output = torch.empty_like(query)
 
-    seq_lens = torch.full((num_seqs, ), case.context_len, dtype=torch.int32,
+    seq_lens = torch.full((num_seqs, ), case.seq_len, dtype=torch.int32,
                           device=device)
     query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32,
                                    device=device)
@@ -248,31 +317,41 @@ def build_inputs(case: Case, device: torch.device):
     # above are distinct per sequence.
     q_offset_rows, q_mask_rows = [], []
     for seq_idx in range(num_seqs):
-        # Padding under one block keeps `doc_len` the padded length, so the
-        # block layout is identical across sequences.
-        pad = seq_idx % BLOCK_SIZE
-        document_lens = [case.doc_len - pad] * case.num_docs
+        # Each pad stays under one block, so `doc_len` remains the padded
+        # length and the block layout is identical across sequences.
+        pads = padding_plan(case.num_docs, seq_idx)
+        document_lens = [case.doc_len - pad for pad in pads]
         document_lens_padded = [case.doc_len] * case.num_docs
         row_offset, row_mask = metadata_for_lazy_attention(
             SimpleNamespace(document_lens=document_lens,
                             document_lens_padded=document_lens_padded),
             BLOCK_SIZE)
-        # The scheduler emits one trailing entry for the query block; the
-        # benchmark's table is document blocks only.
-        q_offset_rows.append(row_offset[:case.blocks_per_seq])
-        q_mask_rows.append(row_mask[:case.blocks_per_seq])
+        # The whole row, trailing query/decode entry included.
+        assert len(row_offset) == case.blocks_per_seq
+        q_offset_rows.append(row_offset)
+        q_mask_rows.append(row_mask)
     q_offset = torch.tensor(q_offset_rows, dtype=torch.int64, device=device)
     q_mask = torch.tensor(q_mask_rows, dtype=torch.int64, device=device)
     assert int(q_offset.max()) <= MAX_PACKED_Q_OFFSET  # Case.validate()
     packed = (block_ids << 32) | (q_offset << 16) | q_mask
 
-    rope = Llama3RotaryEmbedding(head_size=shape.head_size,
-                                 rotary_dim=shape.head_size,
-                                 max_position_embeddings=ROPE_MAX_POSITION,
-                                 base=ROPE_BASE,
-                                 is_neox_style=True,
-                                 dtype=DTYPE,
-                                 **ROPE_SCALING).to(device)
+    # Which RoPE the model uses is a compile-time branch in the kernel, not a
+    # parameter: ROPE_TYPE=0 compiles the Llama-3 smoothing (a wavelength
+    # comparison and two selects per element) out of the compute path
+    # entirely, so it is the specialization with the best case for computing
+    # in-kernel and has to be measured rather than extrapolated from Llama-3.
+    rope_args = dict(head_size=shape.head_size,
+                     rotary_dim=shape.head_size,
+                     max_position_embeddings=ROPE_MAX_POSITION,
+                     base=ROPE_BASE,
+                     is_neox_style=True,
+                     dtype=DTYPE)
+    if rope_kind == "llama3":
+        rope = Llama3RotaryEmbedding(**rope_args, **ROPE_SCALING).to(device)
+    elif rope_kind == "plain":
+        rope = RotaryEmbedding(**rope_args).to(device)
+    else:
+        raise ValueError(f"unknown rope kind {rope_kind!r}")
 
     return dict(
         output_ptr=output,
@@ -325,40 +404,43 @@ def build_inputs(case: Case, device: torch.device):
     )
 
 
-def launch(kwargs, compute_cos_sin: bool, num_seqs: int, num_kv_heads: int):
-    return kernel_paged_attention_2d_llama[(num_seqs, num_kv_heads)](
-        **kwargs, COMPUTE_COS_SIN=compute_cos_sin)
+def launch(kwargs, compute_cos_sin: bool, num_seqs: int, num_kv_heads: int,
+           kernel):
+    return kernel[(num_seqs, num_kv_heads)](**kwargs,
+                                            COMPUTE_COS_SIN=compute_cos_sin)
 
 
-def time_variant(kwargs, compute_cos_sin, case, iters) -> float:
+def time_variant(kwargs, compute_cos_sin, case, iters, kernel) -> float:
     """Mean ms per launch over `iters`, measured with CUDA events."""
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
     torch.cuda.synchronize()
     start.record()
     for _ in range(iters):
         launch(kwargs, compute_cos_sin, case.num_seqs,
-               case.shape.num_kv_heads)
+               case.shape.num_kv_heads, kernel)
     end.record()
     torch.cuda.synchronize()
     return start.elapsed_time(end) / iters
 
 
-def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
-    kwargs = build_inputs(case, device)
+def run_case(case: Case, device, iters: int, reps: int, warmup: int,
+             kernel_name: str = "mixed", rope_kind: str = "llama3") -> dict:
+    kwargs = build_inputs(case, device, rope_kind)
+    kernel = KERNELS[kernel_name]
 
     # Compile + warm caches for both variants before timing either.
     compiled = {}
     for compute in (False, True):
         for _ in range(warmup):
             compiled[compute] = launch(kwargs, compute, case.num_seqs,
-                                       case.shape.num_kv_heads)
+                                       case.shape.num_kv_heads, kernel)
     torch.cuda.synchronize()
 
     # Agreement: same inputs, same kernel, different cos/sin source.
     outputs = {}
     for compute in (False, True):
         kwargs["output_ptr"].zero_()
-        launch(kwargs, compute, case.num_seqs, case.shape.num_kv_heads)
+        launch(kwargs, compute, case.num_seqs, case.shape.num_kv_heads, kernel)
         torch.cuda.synchronize()
         outputs[compute] = kwargs["output_ptr"].clone().float()
     diff = (outputs[False] - outputs[True]).abs()
@@ -399,7 +481,7 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
         order = (False, True) if rep % 2 == 0 else (True, False)
         for compute in order:
             timings[compute].per_iter_ms.append(
-                time_variant(kwargs, compute, case, iters))
+                time_variant(kwargs, compute, case, iters, kernel))
 
     # How many cos/sin pairs a sequence actually evaluates, counted off the
     # metadata that was generated rather than predicted from the case: the
@@ -412,6 +494,8 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
     load, comp = timings[False], timings[True]
     result = dict(
         shape=case.shape.name,
+        kernel=kernel_name,
+        rope=rope_kind,
         num_seqs=case.num_seqs,
         context_len=case.context_len,
         doc_len=case.doc_len,
@@ -475,11 +559,41 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
     def query_set(measurement: int) -> list[str]:
         # Numbered by measurement, never by variant name: "load" and "compute"
         # can tokenize to different lengths, which would hand the two sides
-        # different prefill and decode work on some tokenizers.
+        # different prefill and decode work on some tokenizers. The number is
+        # zero-padded to a fixed width for the same reason -- "10" is two
+        # tokens where "9" is one on some vocabularies, so an unpadded counter
+        # reintroduces the imbalance it was meant to remove. Verified against
+        # the real tokenizer below rather than assumed.
         return [
-            f"Question {measurement}-{idx}: what do the documents describe? "
-            f"Answer:" for idx in range(num_prompts)
+            f"Question {measurement:0{MEASUREMENT_DIGITS}d}-{idx}: what do the "
+            f"documents describe? Answer:" for idx in range(num_prompts)
         ]
+
+    def check_query_sets_are_equal_work(llm, measurements: range) -> None:
+        """Every measurement must be the same amount of tokenized work.
+
+        The A/B assigns measurements to variants alternately, so a query set
+        that tokenizes longer than another does not average out -- it lands on
+        whichever variant drew it, as a throughput difference with the same
+        sign and the same shape as the effect being measured.
+        """
+        tokenizer = llm.get_tokenizer()
+        lengths = {
+            measurement: [len(ids) for ids in
+                          tokenizer(query_set(measurement))["input_ids"]]
+            for measurement in measurements
+        }
+        reference = lengths[measurements[0]]
+        for measurement, observed in lengths.items():
+            if observed != reference:
+                mismatched = next(idx for idx, (a, b) in
+                                  enumerate(zip(observed, reference)) if a != b)
+                raise ValueError(
+                    f"query set {measurement} does not tokenize to the same "
+                    f"lengths as set {measurements[0]} (prompt {mismatched}: "
+                    f"{observed[mismatched]} vs {reference[mismatched]} "
+                    f"tokens). The A/B would compare unequal work; widen "
+                    f"MEASUREMENT_DIGITS or reword the query template.")
 
     # max_num_seqs is the variable under test: the kernel-level win only
     # appears once the decode batch is large, so it has to be settable.
@@ -488,6 +602,8 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
               enforce_eager=True)
     sampling = SamplingParams(max_tokens=max_tokens, temperature=0,
                               ignore_eos=True)
+    # +1 for the warmup round; both variants run in every round.
+    check_query_sets_are_equal_work(llm, range(1, 2 * (rounds + 1) + 1))
 
     def one_round(measurement: int) -> tuple[float, int]:
         start = time.perf_counter()
@@ -526,6 +642,14 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
     compute_median = statistics.median(results["compute"])
     print(f"  compute throughput is {(compute_median / load_median - 1) * 100:+.1f}%"
           " vs load")
+    if min(len(values) for values in results.values()) < 3:
+        # The kernel sweep refuses to call an overlapping pair, and the e2e
+        # difference is smaller and noisier than the kernel one -- so a
+        # percentage off one or two rounds per variant is a number, not a
+        # result, and gets labelled as such rather than left to be quoted.
+        print("  note: fewer than 3 rounds per variant -- that percentage is a "
+              "single draw from a distribution wider than the effect; raise "
+              "--e2e-rounds before quoting it")
     return 0
 
 
@@ -538,6 +662,14 @@ def main() -> int:
     parser.add_argument("--doc-lens", type=int, nargs="+", default=[128, 1024])
     parser.add_argument("--shapes", nargs="+", default=DEFAULT_SHAPES,
                         choices=[shape.name for shape in SHAPES])
+    parser.add_argument("--rope", nargs="+", default=ROPE_KINDS,
+                        choices=ROPE_KINDS,
+                        help="RoPE specialization: llama3 smoothing, or plain "
+                             "(ROPE_TYPE=0, which compiles the smoothing out)")
+    parser.add_argument("--kernels", nargs="+", default=list(KERNELS),
+                        choices=list(KERNELS),
+                        help="decode kernel: the mixed one, or the lazy-only "
+                             "one LAZY_FORCE_SPLIT_DECODE selects")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--reps", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=10)
@@ -566,6 +698,8 @@ def main() -> int:
         args.num_seqs = [8]
         args.context_lens = [4096]
         args.doc_lens = [128]
+        args.rope = ["llama3"]
+        args.kernels = ["mixed"]
 
     device = torch.device("cuda")
     print(f"device : {torch.cuda.get_device_name(device)}")
@@ -582,17 +716,20 @@ def main() -> int:
     for case in cases:
         case.validate()
 
-    header = (f"{'shape':>5} {'seqs':>5} {'ctx':>6} {'doc':>5} {'rot':>5} "
-              f"{'load ms':>9} {'compute ms':>11} {'ratio':>7} {'sep':>4} "
-              f"{'maxdiff':>9}")
+    header = (f"{'shape':>5} {'kernel':>9} {'rope':>6} {'seqs':>5} {'ctx':>6} "
+              f"{'doc':>5} {'rot':>5} {'load ms':>9} {'compute ms':>11} "
+              f"{'ratio':>7} {'sep':>4} {'maxdiff':>9}")
     print(header)
     print("-" * len(header))
 
     results = []
-    for case in cases:
-        result = run_case(case, device, args.iters, args.reps, args.warmup)
+    for kernel_name, rope_kind, case in itertools.product(
+            args.kernels, args.rope, cases):
+        result = run_case(case, device, args.iters, args.reps, args.warmup,
+                          kernel_name, rope_kind)
         results.append(result)
-        print(f"{result['shape']:>5} {result['num_seqs']:>5} "
+        print(f"{result['shape']:>5} {result['kernel']:>9} "
+              f"{result['rope']:>6} {result['num_seqs']:>5} "
               f"{result['context_len']:>6} {result['doc_len']:>5} "
               f"{result['rotations_per_seq']:>5.1f} "
               f"{result['load_ms']:>9.4f} {result['compute_ms']:>11.4f} "
@@ -604,28 +741,46 @@ def main() -> int:
     # whose ranges overlap as a win for whichever median came out lower is how
     # noise gets reported as a result -- the rule this benchmark states in its
     # docstring, applied to its own summary.
-    decided = [result for result in results if result["separated"]]
-    undecided = len(results) - len(decided)
-    if decided:
-        ratios = [result["ratio"] for result in decided]
-        print(f"\ncompute/load ratio over the {len(decided)} decided case(s): "
-              f"median {statistics.median(ratios):.3f}, min {min(ratios):.3f}, "
-              f"max {max(ratios):.3f}")
-        print(f"compute wins {sum(1 for r in ratios if r < 1)}, "
-              f"load wins {sum(1 for r in ratios if r > 1)}")
-    else:
-        print("\nno case separated: nothing measured here is conclusive")
-    if undecided:
-        print(f"inconclusive (ranges overlap): {undecided}/{len(results)}")
-    # Registers are a property of the compiled kernel, i.e. of the shape -- not
-    # of the batch -- so report one line per shape rather than one for the run.
+    #
+    # Summarised per (kernel, RoPE) rather than pooled: those are different
+    # compiled kernels with different register budgets, so a pooled median
+    # would average over the very thing that decides the answer.
+    def summarize(label: str, subset: list[dict]) -> None:
+        decided = [result for result in subset if result["separated"]]
+        undecided = len(subset) - len(decided)
+        if decided:
+            ratios = [result["ratio"] for result in decided]
+            print(f"\n{label}: compute/load over the {len(decided)} decided "
+                  f"case(s): median {statistics.median(ratios):.3f}, min "
+                  f"{min(ratios):.3f}, max {max(ratios):.3f}")
+            print(f"  compute wins {sum(1 for r in ratios if r < 1)}, "
+                  f"load wins {sum(1 for r in ratios if r > 1)}")
+        else:
+            print(f"\n{label}: no case separated, nothing conclusive")
+        if undecided:
+            print(f"  inconclusive (ranges overlap): "
+                  f"{undecided}/{len(subset)}")
+
+    for kernel_name, rope_kind in itertools.product(args.kernels, args.rope):
+        subset = [result for result in results
+                  if result["kernel"] == kernel_name
+                  and result["rope"] == rope_kind]
+        summarize(f"{kernel_name}/{rope_kind}", subset)
+    if len(args.kernels) * len(args.rope) > 1:
+        summarize("all configurations", results)
+    # Registers are a property of the compiled kernel -- of the shape and the
+    # constexpr specialization, not of the batch -- so one line per
+    # (shape, kernel, rope) rather than one for the run.
+    print()
     seen = set()
     for result in results:
-        if result["shape"] in seen:
+        key = (result["shape"], result["kernel"], result["rope"])
+        if key in seen:
             continue
-        seen.add(result["shape"])
+        seen.add(key)
         regs, spills = result["regs"], result["spills"]
-        print(f"{result['shape']:>5} registers/thread: load {regs['load']}, "
+        print(f"{result['shape']:>5} {result['kernel']:>9} "
+              f"{result['rope']:>6} registers/thread: load {regs['load']}, "
               f"compute {regs['compute']}   spills: load {spills['load']}, "
               f"compute {spills['compute']}")
     worst = max(results, key=lambda result: result["max_rel_diff"])
