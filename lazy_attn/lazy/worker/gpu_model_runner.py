@@ -70,6 +70,14 @@ LAZY_SHARED_KV_PROFILE = lazy_shared_kv_profile_enabled()
 LAZY_SHARED_KV_PROFILE_MIN_REQS = lazy_shared_kv_profile_min_reqs()
 LAZY_PACKED_BLOCK_PROFILE = lazy_packed_block_profile_enabled()
 
+# The packed block table gives q_offset 16 bits
+# ([physical_block_idx:32 | q_offset:16 | q_mask:16]), so an offset past this
+# would shift into the physical-block field: the kernel would read a different,
+# possibly out-of-range block and de-rotate by a wrapped position, with no error
+# anywhere. q_offset is the +1-biased sum of the padded document lengths ahead
+# of a block, so this caps the *document region* of a request, not its context.
+MAX_PACKED_Q_OFFSET = 0xFFFF
+
 class LazyGPUModelRunner(GPUModelRunner):
 
     def __init__(
@@ -207,6 +215,17 @@ class LazyGPUModelRunner(GPUModelRunner):
             self.is_lazy_req_cpu[idx] = True
             self.lazy_variant_np[idx] = req_state.lazy_variant
             if req_state.q_offset is not None:
+                if req_state.q_offset and max(
+                        req_state.q_offset) > MAX_PACKED_Q_OFFSET:
+                    raise ValueError(
+                        f"Request {req_id} needs a rotation offset of "
+                        f"{max(req_state.q_offset)}, past the "
+                        f"{MAX_PACKED_Q_OFFSET} the packed block table's "
+                        f"16-bit field holds. Its documents total more than "
+                        f"{MAX_PACKED_Q_OFFSET - 1} padded tokens; send fewer "
+                        f"or shorter documents. Packing this would corrupt the "
+                        f"physical block index and be answered wrongly rather "
+                        f"than reported.")
                 self.lazy_offset_np[idx, :len(req_state.q_offset)] = (
                     req_state.q_offset)
             if req_state.q_mask is not None:

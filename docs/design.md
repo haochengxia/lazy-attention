@@ -240,6 +240,14 @@ inside the group that allocated it — with all three packed:
 Each layer is handed the table for its own group (`layer_name → group`); the
 rotation tensors beside it are group-independent and shared.
 
+Sixteen bits caps `q_offset` at **65535**, and since it is the +1-biased running
+sum of padded document lengths, that caps a request's *document region* — not its
+context. A request whose documents total more than ~64k padded tokens is refused
+when the metadata is written (`_refresh_lazy_metadata_buffers`). The alternative
+is not a smaller error: the overflow lands in the physical block index, so the
+kernel would read a different block, de-rotate by a wrapped position, and answer
+the request wrongly with nothing raised anywhere.
+
 It is rebuilt in full when the batch composition changes (additions, removals, or
 attention-backend reordering — detected by comparing the `req_ids` tuple, plus a
 forced rebuild whenever a new request arrives, which covers an id being reused),
@@ -368,6 +376,9 @@ out of every score by `q_mask`.
 * **KV cache groups** must all use the scheduler's block size — the rotation
   metadata is per block at one block size. Each group gets its own packed block
   table; a group on a different block size is refused.
+* **Document region ≤ 65535 padded tokens per request**, the packed block table's
+  16-bit `q_offset` field (§4.4). Refused, not clamped. The query and the
+  generated tokens are unaffected — this bounds the documents only.
 * **Prompt shape**: documents are always merged **in front of** the prompt, in the
   given order. A preamble that must precede the documents has to be the first
   element of `document_seqs`.
