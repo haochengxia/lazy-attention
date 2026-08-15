@@ -263,12 +263,13 @@ wavelength comparison and two selects per element) out of the compute path
 entirely, and the lazy-only kernel drops the non-lazy branch, freeing ~28
 registers on the 8B shape. Both still lose.
 
-**Rotation density barely matters either.** A 16384-token context in one
-document (1 rotation) and the same context in 128-token documents (128
-rotations) give the same ratio to within noise — 1.12× vs 1.15× on 1B at one
-sequence. The cost is not the per-rotation arithmetic; it is the register
-pressure the compute path carries whether it rotates once or 128 times, since
-the frequency table is evaluated unconditionally.
+**Rotation density barely matters either.** At a fixed 16384-token context,
+splitting it into 1024-token documents (16 rotations) or 128-token ones (128
+rotations) moves the ratio by ~3 points — 1.12× vs 1.15× on 1B, 1.04× vs 1.07×
+on 8B, both at one sequence — for 8× the rotations. The cost is not the
+per-rotation arithmetic; it is the register pressure the compute path carries
+whether it rotates 16 times or 128, since the frequency table is evaluated
+unconditionally.
 
 **Compute wins once the batch is large and the load path is register-bound.**
 At context 4096, mixed kernel, Llama-3 RoPE:
