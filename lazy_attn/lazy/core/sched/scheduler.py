@@ -400,9 +400,20 @@ class LazyScheduler(Scheduler):
                 # The role:
                 # - General new request attends all documents
                 # - Lock all documents by increasing ref cnt
-                if request.has_documents:
+                #
+                # Only on the request's *first* trip through here. A preempted
+                # request comes back through the waiting queue with its prompt
+                # already merged and its document block hashes already in
+                # req_to_block_hashes, so `get_computed_blocks` above has
+                # covered the documents on its own; redoing any of this would
+                # count them twice. It re-merged the prompt too, which is what
+                # made `num_computed_tokens` exceed `num_tokens` and killed the
+                # step on `assert num_new_tokens > 0` below. The is_doc_ready
+                # gate further up still runs every time, so documents evicted
+                # while the request was preempted are respawned before it is
+                # scheduled again.
+                if request.has_documents and request.merge_documents():
                     # Case 2 -> Case 1.2
-                    request.merge_documents()
                     lazy_doc_merges += 1
                     logger.debug(f"Request {request.request_id} merges "
                                  f"documents, total prompt len "
