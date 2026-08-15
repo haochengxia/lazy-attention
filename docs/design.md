@@ -220,11 +220,73 @@ original `Q_full` rather than applied incrementally, so error cannot accumulate
 across a long document list, and it is the inverse rotation
 (`q1·cos + q2·sin`, `−q1·sin + q2·cos`).
 
-cos/sin are **loaded** from the model's `cos_sin_cache` by default; this decode
-kernel is occupancy-bound, and loading measured faster than computing. The
-in-kernel compute path exists behind `LAZY_DECODE_COMPUTE_COS_SIN=1`, with the
-model's RoPE parameters (base, Llama-3 scaling factors) forwarded as constexpr via
-`rope_meta_from_layer` so the computed values equal the table's.
+cos/sin are **loaded** from the model's `cos_sin_cache` by default. An in-kernel
+compute path exists behind `LAZY_DECODE_COMPUTE_COS_SIN=1`, with the model's RoPE
+parameters (base, Llama-3 scaling factors) forwarded as constexpr via
+`rope_meta_from_layer`, so the computed values are the same function of position
+as the table.
+
+### 4.3.1 Load vs compute: what was measured
+
+Computing cos/sin in-kernel looks like a free win — it removes a scattered table
+read from a memory-bound kernel — and it is not. `benchmarks/bench_rope_cos_sin.py`
+A/Bs the two paths with `COMPUTE_COS_SIN` as the *only* difference (same tensors,
+same launch), interleaved and order-alternated across repetitions, reporting
+medians with ranges so a claim is made only when the ranges separate. Numbers
+below are on an RTX 5070 Ti (sm_120), torch 2.7.0+cu128 / triton 3.4.0, bf16,
+block size 16.
+
+**Compute loses almost everywhere.** Across 36 cases (1–32 seqs × 1k/4k/16k
+context × 128/1024-token documents × two head sizes) compute is slower in 36/36,
+median 1.10× the load time, worst 1.35×.
+
+**It wins in exactly one regime:** large-batch decode at `head_size=128`.
+
+| shape | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
+|---|---|---|---|---|
+| `head_size=64` (1B)  | 1.06–1.09× | 1.05–1.09× | 1.04–1.07× | 1.04–1.06× |
+| `head_size=128` (8B) | 1.19× | 0.98× (tie) | **0.88×** | **0.93×** |
+
+(context 4096; `<1` means compute is faster. Ranges separate except at 64 seqs.)
+
+The reason is registers, not memory traffic. Reading `n_regs`/`n_spills` off the
+compiled kernels and computing occupancy:
+
+| shape | path | regs | spills | blocks/SM | active warps |
+|---|---|---|---|---|---|
+| 1B | load    | 128 | 0  | 4 | 16/48 (33%) |
+| 1B | compute | 128 | 8  | 4 | 16/48 (33%) |
+| 8B | load    | 208 | 0  | 2 | 8/48 (17%)  |
+| 8B | compute | 168 | 18 | 3 | 12/48 (25%) |
+
+At `head_size=64` the load path already fits in 128 registers and gets 4 blocks/SM;
+compute cannot buy occupancy that is already there, and pays ~2.7× the PTX
+instruction count (1248 → 3410) plus 48 `ld.local` / 32 `st.local` spill ops. At
+`head_size=128` the load path is the register-hungry one (208 regs, 2 blocks/SM),
+so trading table loads for arithmetic *raises* occupancy 17% → 25% — which is why
+the sign flips there, and only once the batch is large enough to have the warps to
+schedule.
+
+Two things came out of this analysis and are now in the code:
+
+* **The frequency table is hoisted out of the block loop.** `rope_freqs` (the
+  `pow`, plus the Llama-3 smoothing on top of it) is position-independent, so it
+  is evaluated once per program and only `cos/sin(position × freqs)`
+  (`rope_cos_sin_from_freqs`) stays in the loop. On the 1B shape this cut 168 → 128
+  registers and restored compute's occupancy from 25% back to load's 33%, moving
+  the median penalty from 1.17× to 1.10× and the worst case from 1.83× to 1.35×.
+* **The default stays LOAD**, since the shapes where it loses are the common ones.
+
+End to end (Llama-3.2-1B, 128 prompts × 128 tokens) the two are a wash after the
+hoist — 7480 vs 7384 tok/s with overlapping ranges — because decode attention is
+only part of the step.
+
+On numerics, the compute path is not a fallback but arguably the more accurate
+one at ordinary context lengths: `cos_sin_cache` is bf16 (and 33.5 MB for
+Llama-3's 131072 positions, so it is not "small enough to stay in L2" either),
+giving a flat ~2.0e-3 error against an fp64 reference, while the in-kernel fp32
+formula is at 1.2e-4 for positions ≤ 4096 and degrades with position, crossing
+the table's error only near the 131k limit.
 
 ### 4.4 The packed block table
 

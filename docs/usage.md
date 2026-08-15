@@ -179,7 +179,7 @@ Booleans accept `1/true/yes/on`.
 | `NO_LAZY` | clear the per-request lazy flag in the attention wrapper. **A negative control, not a baseline** — see below |
 | `LAZY_FORCE_SPLIT_DECODE` | use the lazy-only decode kernel when the whole batch is lazy |
 | `LAZY_DECODE_IGNORE_Q_MASK` | drop the document padding mask (measurement only — changes results) |
-| `LAZY_DECODE_COMPUTE_COS_SIN` | compute cos/sin in-kernel instead of loading `cos_sin_cache` |
+| `LAZY_DECODE_COMPUTE_COS_SIN` | compute cos/sin in-kernel instead of loading `cos_sin_cache`. Off by default; usually a **slowdown** — see below |
 | `MEPIC_FIRST_BLOCK_RECOMPUTE` | recompute each document's first block instead of reusing it (`mepic` only) |
 | `MEPIC_FORCE_FP32_ROTARY` | do the in-kernel rotation in fp32 |
 
@@ -194,6 +194,15 @@ runs; each becomes a Triton constexpr, so a new value compiles a new kernel.
 > and for confirming a regression comes from the rotation path. For a real
 > baseline, send the same documents inline in the prompt with no `document_seqs`
 > (which is what `scripts/validate_lazy.py` and the `baseline` benchmark SUT do).
+
+> **`LAZY_DECODE_COMPUTE_COS_SIN` is not a free win.** Measured on an RTX 5070 Ti,
+> computing cos/sin in-kernel is slower in 36/36 sweep cases (median 1.10×, worst
+> 1.35×) because it spills registers. It wins — 7–12% — only for large-batch
+> decode (≥128 sequences) at `head_size=128`, where the load path is itself
+> register-bound and the swap buys occupancy. Re-measure on your own shape before
+> turning it on: `python benchmarks/bench_rope_cos_sin.py` sweeps the kernel and
+> `--e2e` does a model-level A/B. Full analysis in
+> [design.md §4.3.1](./design.md#431-load-vs-compute-what-was-measured).
 
 | variable | logs |
 |---|---|
@@ -239,6 +248,11 @@ bash scripts/demo/record_race_gif.sh
 The main benchmark entrypoint is `benchmarks/benchmark_rag_serving.py`, driven by
 the thin shell layer in `scripts/benchmark/`; dataset and SUT aliases live in
 `scripts/benchmark/bench_consts.sh`. See [benchmarks/INTRO.md](../benchmarks/INTRO.md).
+
+For kernel-level questions there is also
+[`benchmarks/bench_rope_cos_sin.py`](../benchmarks/bench_rope_cos_sin.py), which
+A/Bs the decode kernel's two ways of getting cos/sin (`--e2e` for a model-level
+run instead of the kernel sweep).
 
 Note that the benchmark harness selects the lazy SUT with
 `VLLM_USE_LAZY_ATTENTION=1`, which is a **benchmark-side** switch: it tells
