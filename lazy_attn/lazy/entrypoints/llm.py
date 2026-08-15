@@ -129,9 +129,13 @@ class LazyLLM(LLM):
 
             raise ValueError(" ".join(messages))
 
-        # Assigned in the else branch below; without this, the legacy
-        # prompt_token_ids path reaches the call site with it unbound.
-        parsed_document_seqs = None
+        # The documents do not depend on how the prompt itself was passed, so
+        # they are bound outside the branch: leaving this inside the `else`
+        # left the legacy prompt_token_ids path either unbound (before) or
+        # silently document-free (if defaulted to None).
+        parsed_document_seqs = cast(
+            Union[Sequence[PromptType], Sequence[Sequence[PromptType]]],
+            document_seqs)
         if prompt_token_ids is not None:
             parsed_prompts = self._convert_v1_inputs(
                 prompts=cast(Optional[Union[str, list[str]]], prompts),
@@ -140,8 +144,6 @@ class LazyLLM(LLM):
         else:
             parsed_prompts = cast(Union[PromptType, Sequence[PromptType]],
                                   prompts)
-            parsed_document_seqs = cast(Union[Sequence[PromptType], Sequence[Sequence[PromptType]]], 
-                                        document_seqs)
 
         if isinstance(guided_options_request, dict):
             if len(guided_options_request) > 1:
