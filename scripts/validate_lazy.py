@@ -43,7 +43,9 @@ CASES = [
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="unsloth/Llama-3.2-1B-Instruct")
+    parser.add_argument("--model",
+                        default=os.environ.get("LAZY_TEST_MODEL",
+                                               "hxia7/Llama-3.2-1B-Block-FT"))
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--max-model-len", type=int, default=2048)

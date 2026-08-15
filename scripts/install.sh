@@ -2,23 +2,34 @@
 #
 # LazyAttention installer.
 #
-#   bash scripts/install.sh                 # default: prebuilt vLLM wheel + lazy_attn (~2 min)
+#   bash scripts/install.sh                 # prebuilt vLLM wheel + lazy_attn (~2 min)
 #   bash scripts/install.sh --venv .venv    # ... into a fresh virtualenv
 #   bash scripts/install.sh --bench         # ... plus the benchmark dependencies
-#   bash scripts/install.sh --source        # build vLLM from source instead (see vllm_proj/)
-#   bash scripts/install.sh --check         # only report on the environment, install nothing
+#   bash scripts/install.sh --check         # only report on the environment
+#   bash scripts/install.sh --source        # build vLLM from source (see vllm_proj/)
 #
-# LazyAttention and BlockAttention are pure-Python monkey patches over vLLM: the
-# hot path is Triton (JIT-compiled at runtime), so the stock vLLM wheel is all
-# the compiled code you need. Build from source only if you are changing vLLM's
-# own C++/CUDA.
+# LazyAttention and BlockAttention are pure-Python monkey patches over vLLM:
+# no .cu/.cpp of their own, and the hot path is Triton, which is JIT-compiled
+# at runtime. So the stock vLLM wheel already contains every compiled kernel
+# they need -- there is nothing to build. Use --source only if you are changing
+# vLLM's own C++/CUDA.
 #
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-VLLM_VERSION="0.8.5.post1"
-EXPECTED_TORCH="2.6.0"
+# vLLM 0.9.2 is the oldest release whose wheels ship sm_120 (Blackwell) kernels
+# while still exposing the internals LazyAttention patches.
+VLLM_VERSION="0.9.2"
+TORCH_VERSION="2.7.0"
+# torch 2.7.0 on PyPI is a cu126 build with no sm_120 kernels; take cu128.
+TORCH_CUDA="cu128"
+TORCH_INDEX="https://download.pytorch.org/whl/${TORCH_CUDA}"
+# vLLM 0.9.2 predates the transformers 5.x config registry changes.
+TRANSFORMERS_VERSION="4.53.2"
+# Triton 3.3 (torch 2.7's pin) aborts compiling tl.dot for sm_120; 3.4 works
+# and is what torch 2.8+ ships anyway.
+TRITON_SM120_VERSION="3.4.0"
 
 FROM_SOURCE=0
 WITH_BENCH=0
@@ -34,7 +45,7 @@ while [[ $# -gt 0 ]]; do
         --check)      CHECK_ONLY=1; shift ;;
         --no-verify)  VERIFY=0; shift ;;
         --venv)       VENV_PATH="${2:?--venv needs a path}"; shift 2 ;;
-        -h|--help)    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+        -h|--help)    sed -n '3,17p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
         *)            echo "unknown option: $1 (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -52,20 +63,18 @@ if [[ -n "${VENV_PATH}" ]]; then
     pip install --quiet --upgrade pip
 fi
 
-PY="$(command -v python3 || true)"
-[[ -n "${PY}" ]] || die "python3 not found on PATH"
+command -v python3 >/dev/null || die "python3 not found on PATH"
 
-# ------------------------------------------------------------- checks ----
+# ------------------------------------------------------------- report ----
 say "Environment"
-"${PY}" - <<'EOF'
+python3 - <<'EOF'
 import platform, shutil, subprocess, sys
 
 print(f"  python   {platform.python_version()}  ({sys.executable})")
-if not (3, 9) <= sys.version_info[:2] <= (3, 12):
-    print("  ^ vLLM 0.8.5.post1 supports Python 3.9-3.12", file=sys.stderr)
+if not (3, 9) <= sys.version_info[:2] < (3, 13):
+    print("  ^ vLLM 0.9.2 supports Python 3.9-3.12", file=sys.stderr)
 
-nvidia_smi = shutil.which("nvidia-smi")
-if nvidia_smi:
+if nvidia_smi := shutil.which("nvidia-smi"):
     out = subprocess.run(
         [nvidia_smi, "--query-gpu=name,memory.total,compute_cap",
          "--format=csv,noheader"],
@@ -76,22 +85,42 @@ if nvidia_smi:
 else:
     print("  gpu      no nvidia-smi found")
 
-nvcc = shutil.which("nvcc")
-print(f"  nvcc     {nvcc or 'not found (only needed for --source)'}")
+print(f"  nvcc     {shutil.which('nvcc') or 'not found (only needed for --source)'}")
 EOF
 
+# Blackwell consumer cards need a newer Triton than torch 2.7 pins.
+NEEDS_SM120=0
+if command -v nvidia-smi >/dev/null 2>&1; then
+    while read -r cap; do
+        [[ "${cap}" == "12.0" ]] && NEEDS_SM120=1
+    done < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null || true)
+fi
+
 if [[ ${CHECK_ONLY} -eq 1 ]]; then
+    [[ ${NEEDS_SM120} -eq 1 ]] && \
+        say "Detected sm_120: would install Triton ${TRITON_SM120_VERSION}"
     say "Check only; nothing installed."
     exit 0
 fi
 
 # -------------------------------------------------------------- vllm ----
 if [[ ${FROM_SOURCE} -eq 1 ]]; then
-    say "Building vLLM ${VLLM_VERSION} from source (this takes 20-60 min)"
+    say "Building vLLM from source (20-60 min)"
     bash "${REPO_ROOT}/vllm_proj/install.sh"
 else
-    say "Installing vLLM ${VLLM_VERSION} (prebuilt wheel)"
-    pip install "vllm==${VLLM_VERSION}"
+    say "Installing vLLM ${VLLM_VERSION} with torch ${TORCH_VERSION}+${TORCH_CUDA}"
+    pip install \
+        --index-url "${TORCH_INDEX}" \
+        --extra-index-url https://pypi.org/simple \
+        "vllm==${VLLM_VERSION}" \
+        "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
+        "transformers==${TRANSFORMERS_VERSION}"
+fi
+
+if [[ ${NEEDS_SM120} -eq 1 ]]; then
+    say "Blackwell (sm_120) detected -- installing Triton ${TRITON_SM120_VERSION}"
+    echo "  Triton 3.3 cannot compile tl.dot for sm_120."
+    pip install "triton==${TRITON_SM120_VERSION}"
 fi
 
 # ---------------------------------------------------------- lazy_attn ----
@@ -110,19 +139,16 @@ if [[ ${VERIFY} -eq 0 ]]; then
 fi
 
 say "Verifying"
-"${PY}" - "${EXPECTED_TORCH}" <<'EOF'
+python3 - <<'EOF'
 import sys
 
-expected_torch = sys.argv[1]
 problems = []
 
 import torch
 print(f"  torch    {torch.__version__} (cuda {torch.version.cuda})")
-if not torch.__version__.startswith(expected_torch):
-    problems.append(
-        f"torch is {torch.__version__}, but vLLM 0.8.5.post1 is built against "
-        f"{expected_torch}; its compiled kernels will not load."
-    )
+
+import triton
+print(f"  triton   {triton.__version__}")
 
 import vllm
 print(f"  vllm     {vllm.__version__}")
@@ -133,10 +159,9 @@ try:
 except ImportError as exc:
     problems.append(
         f"vllm._C failed to import ({exc}). The vLLM install has no compiled "
-        "kernels -- a source build that silently failed leaves it in this state."
-    )
+        "kernels -- a source build that silently failed leaves it in this state.")
 
-import lazy.__vllm__  # noqa: F401  (applies the LazyAttention patches)
+import lazy.__vllm__  # noqa: F401  applies the LazyAttention patches
 print("  lazy     patches applied")
 
 if torch.cuda.is_available():
@@ -148,9 +173,13 @@ if torch.cuda.is_available():
     if arch not in supported:
         problems.append(
             f"{name} is {arch}, but this torch only ships {', '.join(supported)}. "
-            "Every CUDA kernel will fail with 'no kernel image is available'. "
-            "See scripts/install_sm120.sh for Blackwell (sm_120) consumer cards."
-        )
+            "Every CUDA kernel will fail with 'no kernel image is available'.")
+    if (major, minor) >= (12, 0):
+        major_t, minor_t = (int(p) for p in triton.__version__.split(".")[:2])
+        if (major_t, minor_t) < (3, 4):
+            problems.append(
+                f"Triton {triton.__version__} cannot compile tl.dot for {arch}; "
+                "install triton>=3.4.0.")
 else:
     problems.append("torch.cuda.is_available() is False -- no usable GPU.")
 
@@ -161,4 +190,4 @@ if problems:
     sys.exit(1)
 EOF
 
-say "Done. Try: bash scripts/validate.sh"
+say "Done. Try: python scripts/validate_lazy.py"
