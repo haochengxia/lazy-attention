@@ -196,12 +196,18 @@ runs; each becomes a Triton constexpr, so a new value compiles a new kernel.
 > (which is what `scripts/validate_lazy.py` and the `baseline` benchmark SUT do).
 
 > **`LAZY_DECODE_COMPUTE_COS_SIN` is not a free win.** Measured on an RTX 5070 Ti,
-> computing cos/sin in-kernel is slower in 36/36 sweep cases (median 1.10×, worst
-> 1.35×) because it spills registers. It wins — 7–12% — only for large-batch
-> decode (≥128 sequences) at `head_size=128`, where the load path is itself
-> register-bound and the swap buys occupancy. Re-measure on your own shape before
-> turning it on: `python benchmarks/bench_rope_cos_sin.py` sweeps the kernel and
-> `--e2e` does a model-level A/B. Full analysis in
+> computing cos/sin in-kernel is slower in 36/36 kernel sweep cases (median 1.10×,
+> worst 1.35×) because it spills registers. It wins — 8–12% *on that kernel* —
+> only for large-batch decode (≥128 sequences) at `head_size=128`, which is most
+> production Llama serving; it is a property of the head size and the batch, not
+> of model size (70B compiles to the same kernel as 8B).
+>
+> **That kernel win did not show up end to end**, though: on a `head_size=128`
+> model at 256 concurrent requests, two runs of the same configuration gave +2.5%
+> and −6.3%. So treat it as worth an A/B on your own deployment when you are
+> running large decode batches, not as a setting to turn on because the shape
+> matches. `python benchmarks/bench_rope_cos_sin.py` sweeps the kernel and
+> `--e2e` does the model-level comparison. Full analysis in
 > [design.md §4.3.1](./design.md#431-load-vs-compute-what-was-measured).
 
 | variable | logs |

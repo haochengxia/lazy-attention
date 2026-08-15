@@ -305,9 +305,19 @@ Two things came out of this analysis and are now in the code:
   the median penalty from 1.17× to 1.10× and the worst case from 1.83× to 1.35×.
 * **The default stays LOAD**, since the shapes where it loses are the common ones.
 
-End to end (Llama-3.2-1B, 128 prompts × 128 tokens) the two are a wash after the
-hoist — 7480 vs 7384 tok/s with overlapping ranges — because decode attention is
-only part of the step.
+**None of this was resolvable end to end**, which is the number that would
+actually justify flipping the flag in production. On Llama-3.2-1B (the shape that
+loses at kernel level) the two are a wash after the hoist: 7480 vs 7384 tok/s,
+overlapping ranges. On Llama-3.2-3B — `head_size=128`, i.e. the shape that wins
+8–12% at kernel level — at 256 prompts and `max_num_seqs=256`, two runs of the
+identical configuration gave **+2.5% and −6.3%**, both with overlapping ranges.
+Decode attention is a slice of the step, and here the slice is smaller than the
+run-to-run noise. Treat the kernel result as a reason to *measure* on a
+deployment, not as a reason to turn the flag on.
+
+(The `--e2e` harness gives every measurement its own query set. Reusing one meant
+the second variant of each round ran against a prefix cache the first had just
+filled, which was worth more than 2× in throughput and swamped everything.)
 
 On numerics, the compute path is not a fallback but arguably the more accurate
 one at ordinary context lengths: `cos_sin_cache` is bf16 (and 33.5 MB for

@@ -312,7 +312,8 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
     return result
 
 
-def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int) -> int:
+def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
+            max_num_seqs: int, gpu_util: float) -> int:
     """What the kernel difference is worth end to end, on a real model.
 
     Both variants run against one engine in one process -- the switch is read
@@ -330,17 +331,31 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int) -> int:
         f"Document {doc_idx}: " + "context words for retrieval augmented "
         "generation " * 12 for doc_idx in range(8)
     ] for _ in range(num_prompts)]
-    prompts = ["Question: what do the documents describe? Answer:"
-               ] * num_prompts
+    # Every measurement gets its own query set, for two reasons. Repeating a
+    # query set makes the *second* variant of a round run against a prefix cache
+    # the first one just filled -- the single largest confound here, worth more
+    # than 2x in throughput. And identical queries within a set make every
+    # request after the first a full prefix-cache hit (documents and query
+    # alike), which trips `assert num_new_tokens > 0` in the lazy scheduler.
+    # The documents are deliberately *not* varied: reusing a hot corpus across
+    # requests is the case LazyAttention exists for.
+    def query_set(tag: str) -> list[str]:
+        return [
+            f"Question {tag}-{idx}: what do the documents describe? Answer:"
+            for idx in range(num_prompts)
+        ]
 
-    llm = LLM(model=model, gpu_memory_utilization=0.6, max_model_len=4096,
+    # max_num_seqs is the variable under test: the kernel-level win only
+    # appears once the decode batch is large, so it has to be settable.
+    llm = LLM(model=model, gpu_memory_utilization=gpu_util,
+              max_model_len=4096, max_num_seqs=max_num_seqs,
               enforce_eager=True)
     sampling = SamplingParams(max_tokens=max_tokens, temperature=0,
                               ignore_eos=True)
 
-    def one_round() -> tuple[float, int]:
+    def one_round(tag: str) -> tuple[float, int]:
         start = time.perf_counter()
-        outputs = llm.generate(prompts=prompts, sampling_params=sampling,
+        outputs = llm.generate(prompts=query_set(tag), sampling_params=sampling,
                                document_seqs=documents, use_tqdm=False)
         elapsed = time.perf_counter() - start
         return elapsed, sum(len(o.outputs[0].token_ids) for o in outputs)
@@ -351,14 +366,14 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int) -> int:
                      if round_idx % 2 == 0 else ("compute", "load")):
             os.environ["LAZY_DECODE_COMPUTE_COS_SIN"] = (
                 "1" if name == "compute" else "0")
-            elapsed, tokens = one_round()
+            elapsed, tokens = one_round(f"r{round_idx}{name}")
             if round_idx == 0:
                 continue  # warmup round: JIT compile + cache warm
             results[name].append(tokens / elapsed)
     os.environ.pop("LAZY_DECODE_COMPUTE_COS_SIN", None)
 
     print(f"\nend to end ({model}, {max_tokens} tokens x {num_prompts} "
-          f"prompts, {rounds} rounds)")
+          f"prompts, max_num_seqs={max_num_seqs}, {rounds} rounds)")
     for name, values in results.items():
         print(f"  {name:>8}: {statistics.median(values):8.1f} tok/s   "
               f"(range {min(values):.1f} - {max(values):.1f})")
@@ -390,11 +405,14 @@ def main() -> int:
     parser.add_argument("--e2e-rounds", type=int, default=4)
     parser.add_argument("--e2e-max-tokens", type=int, default=128)
     parser.add_argument("--e2e-prompts", type=int, default=16)
+    parser.add_argument("--e2e-max-num-seqs", type=int, default=256)
+    parser.add_argument("--e2e-gpu-util", type=float, default=0.6)
     args = parser.parse_args()
 
     if args.e2e:
         return run_e2e(args.e2e_model, args.e2e_rounds, args.e2e_max_tokens,
-                       args.e2e_prompts)
+                       args.e2e_prompts, args.e2e_max_num_seqs,
+                       args.e2e_gpu_util)
 
     if args.quick:
         args.shapes = ["8B"]
