@@ -37,8 +37,8 @@ irrelevant.
     python benchmarks/bench_rope_cos_sin.py --e2e         # model-level A/B
 
 What it found (RTX 5070 Ti, sm_120, torch 2.7.0+cu128 / triton 3.4.0): over the
-144 sweep cases (1-32 seqs x both kernels x both RoPE types) 105 separated and
-compute lost every one of them, median 1.11x; the other 39 are reported as
+144 sweep cases (1-32 seqs x both kernels x both RoPE types) 75 separated and
+compute lost every one of them, median 1.13x; the other 69 are reported as
 inconclusive, not as wins. Compute turns a profit only for large-batch decode
 at head_size=128 (0.89x at 128 seqs), where the load path is itself
 register-bound so the swap buys occupancy. Hence LOAD stays the default.
@@ -157,10 +157,23 @@ def padding_plan(num_docs: int, seq_idx: int) -> list[int]:
     The first entry is non-zero, so the total padding is always at least 1 and
     the first document always rotates. With one document there is nothing to
     rotate between, and every sequence necessarily gets the same plan.
+
+    `seq_idx` selects a permutation by factorial-base (Lehmer) index, which is
+    distinct for `seq_idx < num_docs!`. Cyclically rotating the list instead
+    (the previous version) has period `num_docs`, and since `base` itself
+    repeats every `BLOCK_SIZE` entries, a period of only 16 for any longer
+    document list -- so a 256-sequence batch had 16 distinct access traces and
+    handed the load path a working set 16x smaller than the label claimed,
+    biasing exactly the large-batch crossover this is used to measure.
+    `run_case` reports the distinct-trace count so a regression here is visible
+    rather than inferred.
     """
-    base = [(doc_idx * 5 + 1) % BLOCK_SIZE for doc_idx in range(num_docs)]
-    split = seq_idx % num_docs
-    return base[split:] + base[:split]
+    items = [(doc_idx * 5 + 1) % BLOCK_SIZE for doc_idx in range(num_docs)]
+    plan, index = [], seq_idx
+    for slot in range(num_docs, 0, -1):
+        index, pick = divmod(index, slot)
+        plan.append(items.pop(pick))
+    return plan
 
 
 @dataclass
@@ -238,7 +251,7 @@ class Case:
         plan `build_inputs` will use.
         """
         best = 0
-        for seq_idx in range(min(self.num_seqs, self.num_docs)):
+        for seq_idx in range(self.num_seqs):
             pads = padding_plan(self.num_docs, seq_idx)
             true_lens = [self.doc_len - pad for pad in pads]
             best = max(best, sum(pads) + sum(true_lens[:-1]) + 1)
@@ -490,6 +503,12 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int,
     changes = (offsets[:, 1:] != offsets[:, :-1]) & (offsets[:, 1:] > 1)
     rotations = changes.sum(dim=1) + (offsets[:, 0] > 1)
     mean_rotations = rotations.float().mean().item()
+    # How many distinct cos/sin access traces the batch actually contains. Two
+    # sequences with the same offset row read the same table rows, so a batch
+    # with few distinct rows gives the load path an L2 working set that shrinks
+    # with the repetition rather than with the batch -- the confound the
+    # distinct KV blocks and the per-sequence padding plans exist to avoid.
+    distinct_traces = len({tuple(row) for row in offsets.tolist()})
 
     load, comp = timings[False], timings[True]
     result = dict(
@@ -500,6 +519,7 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int,
         context_len=case.context_len,
         doc_len=case.doc_len,
         rotations_per_seq=mean_rotations,
+        distinct_traces=distinct_traces,
         load_ms=load.median,
         load_range=[load.lo, load.hi],
         compute_ms=comp.median,
@@ -760,6 +780,21 @@ def main() -> int:
         if undecided:
             print(f"  inconclusive (ranges overlap): "
                   f"{undecided}/{len(subset)}")
+
+    # A case whose sequences share offset rows is measuring a smaller working
+    # set than its batch size suggests. It is bounded by num_docs! and so is
+    # unavoidable for short document lists -- reported rather than hidden.
+    repeated = [result for result in results
+                if result["distinct_traces"] < result["num_seqs"]]
+    if repeated:
+        worst = min(repeated,
+                    key=lambda r: r["distinct_traces"] / r["num_seqs"])
+        print(f"\nnote: {len(repeated)}/{len(results)} case(s) have fewer "
+              f"distinct rotation traces than sequences (worst: "
+              f"{worst['distinct_traces']} traces over {worst['num_seqs']} "
+              f"seqs at ctx={worst['context_len']}/doc={worst['doc_len']}); "
+              f"with few documents there are only so many orderings, and the "
+              f"load path sees a warmer table there")
 
     for kernel_name, rope_kind in itertools.product(args.kernels, args.rope):
         subset = [result for result in results

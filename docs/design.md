@@ -246,16 +246,16 @@ register budget. Numbers below are on an RTX 5070 Ti (sm_120), torch
 
 **Compute loses almost everywhere.** Across 144 cases (1–32 seqs × 1k/4k/16k
 context × 128/1024-token documents × two head sizes × {mixed, lazy-only} kernel
-× {Llama-3, plain} RoPE), 105 separated; compute lost all 105, median 1.11× the
-load time, worst 1.23×. The other 39 are reported as inconclusive rather than
+× {Llama-3, plain} RoPE), 75 separated; compute lost all 75, median 1.13× the
+load time, worst 1.23×. The other 69 are reported as inconclusive rather than
 assigned to whichever median came out lower. Per configuration:
 
 | kernel | RoPE | decided | median | worst |
 |---|---|---|---|---|
-| mixed     | Llama-3 | 31/36 | 1.12× | 1.20× |
-| mixed     | plain   | 29/36 | 1.11× | 1.23× |
-| lazy-only | Llama-3 | 22/36 | 1.13× | 1.19× |
-| lazy-only | plain   | 23/36 | 1.11× | 1.21× |
+| mixed     | Llama-3 | 21/36 | 1.13× | 1.23× |
+| mixed     | plain   | 21/36 | 1.13× | 1.22× |
+| lazy-only | Llama-3 | 17/36 | 1.13× | 1.22× |
+| lazy-only | plain   | 16/36 | 1.13× | 1.21× |
 
 Neither the RoPE type nor the kernel changes the answer, which is worth stating
 because they change the *code*: plain RoPE compiles the Llama-3 smoothing (a
@@ -265,19 +265,27 @@ registers on the 8B shape. Both still lose.
 
 **Rotation density barely matters either.** At a fixed 16384-token context,
 splitting it into 1024-token documents (16 rotations) or 128-token ones (128
-rotations) moves the ratio by ~3 points — 1.12× vs 1.15× on 1B, 1.04× vs 1.07×
+rotations) moves the ratio by ~3 points — 1.11× vs 1.18× on 1B, 1.04× vs 1.06×
 on 8B, both at one sequence — for 8× the rotations. The cost is not the
 per-rotation arithmetic; it is the register pressure the compute path carries
 whether it rotates 16 times or 128, since the frequency table is evaluated
 unconditionally.
+
+Sequences within a batch get *distinct* padding permutations of that fixed
+budget (a factorial-base index, not a cyclic rotation), so they read distinct
+`cos_sin_cache` rows: a batch of 256 has 256 distinct rotation traces wherever
+there are at least 8 documents to permute. Below that the count is capped by
+`num_docs!` — a single-document case has one trace no matter the batch — and the
+benchmark prints which cases those are rather than leaving the load path
+quietly favoured by a warm table.
 
 **Compute wins once the batch is large and the load path is register-bound.**
 At context 4096, mixed kernel, Llama-3 RoPE:
 
 | shape | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
 |---|---|---|---|---|
-| `head_size=64` (1B)  | 1.10× | 1.09× | 1.06× | 1.06× |
-| `head_size=128` (8B) | 1.21× | 0.99× (overlapping) | **0.89×** | **0.93×** |
+| `head_size=64` (1B)  | 1.12× | 1.07× | 1.06× | 1.06× |
+| `head_size=128` (8B) | 1.23× | 0.99× (overlapping) | **0.89×** | **0.93×** |
 
 (`<1` means compute is faster. Ranges separate except at 64 seqs. The crossover
 reproduces in all four kernel/RoPE configurations, within a point.)
@@ -313,10 +321,10 @@ Measured at 4096 context (`--shapes` in the benchmark):
 
 | shape | regs load → compute | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
 |---|---|---|---|---|---|
-| 8B (hs 128, group 4)   | 208 → 168 | 1.21× | 0.99×\* | 0.89× | 0.93× |
-| 70B (hs 128, group 8)  | 208 → 165 | 1.21× | 0.97×\* | 0.90× | 0.93× |
-| hs 256 (group 4)       | 253 → 255 | 1.01×\* | 1.00×\* | 0.99× | 0.99× |
-| MQA (hs 128, group 32) | 255 → 234 | 0.92× | 0.92× | 0.92× | 0.92× |
+| 8B (hs 128, group 4)   | 208 → 168 | 1.23× | 0.99×\* | 0.89× | 0.93× |
+| 70B (hs 128, group 8)  | 208 → 165 | 1.18× | 0.97×\* | 0.89× | 0.95×\* |
+| hs 256 (group 4)       | 253 → 255 | 0.99×\* | 0.99×\* | 0.99×\* | 0.99×\* |
+| MQA (hs 128, group 32) | 255 → 234 | 0.93× | 0.93× | 0.93× | 0.91× |
 
 (\* ranges overlap.) 70B tracks 8B to within a percent at every batch size,
 which is the point. Doubling `head_size` to 256 does *not* continue the trend:
@@ -331,7 +339,7 @@ head the grid is only `num_seqs` programs across 70 SMs, so that kernel is
 latency-bound rather than occupancy-bound. It is also the one row that does not
 survive changing the specialization: on the **lazy-only** kernel the same shape
 is a wash under Llama-3 RoPE (1.00×, overlapping at every batch) and a clear
-*loss* under plain RoPE (1.10–1.25×), where the compute path's register saving
+*loss* under plain RoPE (1.12–1.22×), where the compute path's register saving
 is larger (250 → 168) but the win is gone. That has not been investigated
 further; it is the concrete reason the recommendation below is "measure your own
 shape" rather than a rule.
