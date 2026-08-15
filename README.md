@@ -59,6 +59,10 @@ Tests default to the 1B `hxia7/Llama-3.2-1B-Block-FT` so they fit on a single
 consumer GPU. Set `LAZY_TEST_MODEL=ldsjmdy/Tulu3-Block-FT` to reproduce the
 paper's 8B accuracy numbers.
 
+Three kernel/utility modules import helpers from vLLM's own `tests.*` package,
+which the wheel does not ship; they are skipped automatically (with a warning
+naming each one) unless you are running against a vLLM source checkout.
+
 ## Demo: Lazy-Attn vs Prefix Caching
 
 <div style="text-align: center;">

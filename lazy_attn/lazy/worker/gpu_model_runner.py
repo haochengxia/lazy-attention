@@ -203,9 +203,15 @@ class LazyGPUModelRunner(GPUModelRunner):
         # The base method used to expose `batch_changed or batch_reordered`
         # here. Rather than depend on internals that move between releases,
         # detect it from the batch itself -- a different req_id ordering covers
-        # both additions/removals and attention-backend reordering.
+        # additions, removals and attention-backend reordering.
+        #
+        # The one case ordering cannot see is a request ID being reused: abort
+        # `r0`, then submit a new `r0` that lands in the same slot. The ID
+        # tuple is unchanged but the documents and block IDs behind it are not,
+        # so any request arriving as new also forces a rebuild.
         req_ids_snapshot = tuple(self.input_batch.req_ids)
-        if req_ids_snapshot != self._last_req_ids:
+        if (scheduler_output.scheduled_new_reqs
+                or req_ids_snapshot != self._last_req_ids):
             self._last_req_ids = req_ids_snapshot
             self._refresh_lazy_metadata_buffers()
             self._packed_block_table_full_rebuild = True

@@ -210,7 +210,11 @@ class LazyRequest:
 
     @property
     def use_structured_output(self) -> bool:
-        return self.sampling_params.guided_decoding is not None
+        # `sampling_params` is None for pooling requests (embedding /
+        # classification), which the scheduler still asks about -- so the
+        # None guard is load-bearing, not defensive.
+        return (self.sampling_params is not None
+                and self.sampling_params.guided_decoding is not None)
 
     def record_event(
         self,

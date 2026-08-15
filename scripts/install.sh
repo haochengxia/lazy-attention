@@ -105,6 +105,18 @@ fi
 
 # -------------------------------------------------------------- vllm ----
 if [[ ${FROM_SOURCE} -eq 1 ]]; then
+    # vllm_proj/install.sh requires torch to already be importable (vLLM's
+    # setup.py reads torch to configure the CUDA build), so a fresh
+    # virtualenv has to be seeded first -- otherwise the source path dies at
+    # its prerequisite check before cloning anything.
+    say "Installing build prerequisites (torch ${TORCH_VERSION}+${TORCH_CUDA})"
+    pip install \
+        --index-url "${TORCH_INDEX}" \
+        --extra-index-url https://pypi.org/simple \
+        "torch==${TORCH_VERSION}+${TORCH_CUDA}" \
+        "transformers==${TRANSFORMERS_VERSION}"
+    pip install cmake ninja setuptools_scm
+
     say "Building vLLM from source (20-60 min)"
     bash "${REPO_ROOT}/vllm_proj/install.sh"
 else

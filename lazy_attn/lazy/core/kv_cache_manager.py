@@ -92,6 +92,11 @@ class LazyKVCacheManager(KVCacheManager):
         # the last token to obtain logits, so it caps the hit length at
         # num_tokens - 1. A *document* request never samples a token -- it only
         # populates the KV cache -- so it may be served entirely from cache.
+        #
+        # The EAGLE trim (drop the last matched block so the drafting head can
+        # recompute its hidden state) is not applied here: since 0.9.0 it lives
+        # inside `find_longest_cache_hit`, which reads `use_eagle` off the
+        # coordinator we delegate to below.
         if request.is_document_request:
             max_cache_hit_length = request.num_tokens
         else:
@@ -168,9 +173,14 @@ class LazyKVCacheManager(KVCacheManager):
         self.doc_cache_queries += call_queries
         self.doc_cache_hits += call_hits
         if self.log_stats and self.prefix_cache_stats is not None:
+            # PrefixCacheStats counts *tokens* -- get_computed_blocks adds
+            # request.num_tokens / num_new_computed_tokens -- so convert the
+            # per-document block counts before mixing them into the same
+            # aggregate, or every document contribution is understated by a
+            # factor of block_size.
             self.prefix_cache_stats.requests += 1
-            self.prefix_cache_stats.queries += call_queries
-            self.prefix_cache_stats.hits += call_hits
+            self.prefix_cache_stats.queries += call_queries * self.block_size
+            self.prefix_cache_stats.hits += call_hits * self.block_size
         if self.doc_cache_queries - self._doc_hit_last_log >= 200:
             self._doc_hit_last_log = self.doc_cache_queries
             ratio = self.doc_cache_hits / max(self.doc_cache_queries, 1)

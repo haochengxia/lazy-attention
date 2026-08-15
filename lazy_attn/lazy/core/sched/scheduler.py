@@ -209,10 +209,18 @@ class LazyScheduler(Scheduler):
                 req_index += 1
                 continue
 
+            # Tokens scheduled past the request's own length are speculative
+            # drafts; the cache manager must know not to treat them as
+            # committed when it caches blocks.
+            num_draft_tokens = max(
+                num_new_tokens + request.num_computed_tokens -
+                request.num_tokens, 0)
+
             while True:
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
+                    num_draft_tokens=num_draft_tokens,
                     num_lookahead_tokens=self.num_lookahead_tokens)
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -680,21 +688,9 @@ class LazyScheduler(Scheduler):
         logger.debug(f"request {request.request_id} "
                      f"doc {doc_idx} not ready (add to waiting), "
                      f"hash {sha256(tuple(request.documents_token_ids_padded[doc_idx]))}")
-        # Spawn a new request for the document and add it to the top of waiting
-        sampling_params = copy.deepcopy(request.sampling_params)
-        sampling_params.max_tokens = 1 # TODO(haocheng): how to avoid
-        req = Request(
-            request_id=f"{request.request_id}_d{doc_idx}",
-            prompt_token_ids=request.documents_token_ids_padded[doc_idx],
-            multi_modal_inputs=request.mm_inputs,
-            multi_modal_hashes=request.mm_hashes,
-            multi_modal_placeholders=request.mm_positions,
-            sampling_params=sampling_params,
-            eos_token_id=request.eos_token_id,
-            is_document_request=True,
-            arrival_time=request.arrival_time,
-        )
-        self.add_request(req, left=True)
+        # NOTE(haocheng): new spawned doc has higher priority than other
+        # waiting reqs, since it is blocking the query request.
+        self.add_request(build_document_request(request, doc_idx), left=True)
 
 def metadata_for_lazy_attention_old(request: Request, block_size: int) -> tuple[list[int], list[int]]:
     """Generate the metadata for lazy attention."""
@@ -721,6 +717,35 @@ def metadata_for_lazy_attention_old(request: Request, block_size: int) -> tuple[
     
     q_offset[cursor] = sum(request.document_lens_padded) - request.document_lens[-1]
     return list(q_offset), list(q_mask)
+
+
+def build_document_request(request: Request, doc_idx: int) -> Request:
+    """The request that populates one document's KV blocks.
+
+    It only ever prefills: the blocks it writes are what the parent request
+    later finds via `hash_request_tokens_docs`, so everything that feeds a
+    block hash has to line up between the two.
+
+    - `cache_salt` is forwarded, because the per-document hashes include it.
+    - `lora_request` is deliberately *not*. Upstream folds the LoRA id into
+      every block's extra keys while the per-document hashes do not, so a LoRA
+      document request would populate blocks the parent can never match --
+      leaving `is_doc_ready` false forever. Documents + LoRA is unsupported.
+    """
+    sampling_params = copy.deepcopy(request.sampling_params)
+    sampling_params.max_tokens = 1  # TODO(haocheng): how to avoid
+    return Request(
+        request_id=f"{request.request_id}_d{doc_idx}",
+        prompt_token_ids=request.documents_token_ids_padded[doc_idx],
+        multi_modal_inputs=request.mm_inputs,
+        multi_modal_hashes=request.mm_hashes,
+        multi_modal_placeholders=request.mm_positions,
+        sampling_params=sampling_params,
+        eos_token_id=request.eos_token_id,
+        is_document_request=True,
+        arrival_time=request.arrival_time,
+        cache_salt=request.cache_salt,
+    )
 
 
 def metadata_for_lazy_attention(request: Request, block_size: int) -> tuple[list[int], list[int]]:

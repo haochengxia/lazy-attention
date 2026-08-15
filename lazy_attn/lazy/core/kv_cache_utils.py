@@ -2,13 +2,25 @@
 Changed by Haocheng at 2025/09/07
 """
 
-from typing import Any
+from typing import Any, Optional
 
-from vllm.v1.core.kv_cache_utils import need_extra_keys, generate_block_hash_extra_keys, hash_block_tokens
+from vllm.v1.core.kv_cache_utils import hash_block_tokens
 from vllm.v1.core.kv_cache_utils import BlockHash
 
 from lazy.request import LazyRequest as Request
 
+
+
+def cache_salt_extra_keys(request: Request) -> Optional[tuple[Any, ...]]:
+    """The extra hash keys vLLM attaches to the *first* block of a request.
+
+    A `cache_salt` exists to keep two otherwise identical prefixes in separate
+    cache entries, so it has to reach every hash the lazy paths compute -- both
+    the per-document hashes and the query hashes chained behind them.
+    Upstream folds the salt in via `generate_block_hash_extra_keys`; the lazy
+    paths hash documents rather than a token prefix, so they take it from here.
+    """
+    return (request.cache_salt, ) if request.cache_salt else None
 
 
 def hash_request_tokens_docs(hash_function: Any, block_size: int,
@@ -17,6 +29,11 @@ def hash_request_tokens_docs(hash_function: Any, block_size: int,
     Note the the return value is a list of lists, where each inner list contains
     the hash values for a single document."""
     documents_token_ids = request.documents_token_ids_padded
+    # Each document is hashed as a standalone chain, so each one carries the
+    # salt on its own first block. This matches what the base
+    # `hash_request_tokens` computes for the spawned document requests, which
+    # inherit the salt from their parent.
+    salt_keys = cache_salt_extra_keys(request)
 
     ret = [[] for _ in range(len(documents_token_ids))]
     for doc_idx, token_ids in enumerate(documents_token_ids):
@@ -29,7 +46,8 @@ def hash_request_tokens_docs(hash_function: Any, block_size: int,
                 break
 
             block_hash = hash_block_tokens(hash_function, parent_block_hash_value,
-                                        block_token_ids, None)
+                                        block_token_ids,
+                                        salt_keys if start == 0 else None)
             ret[doc_idx].append(block_hash)
             parent_block_hash_value = block_hash.hash_value
     return ret
@@ -40,6 +58,7 @@ def hash_request_tokens_with_doc_hash(hash_function: Any, block_size: int,
     """The only difference between this function and the original one is that
     the hash of the document sequence is used as the prefix for the block hash."""
     token_ids = request.all_token_ids
+    salt_keys = cache_salt_extra_keys(request)
 
     ret = []
     parent_block_hash_value = request.document_seq_hash
@@ -53,7 +72,8 @@ def hash_request_tokens_with_doc_hash(hash_function: Any, block_size: int,
             break
 
         block_hash = hash_block_tokens(hash_function, parent_block_hash_value,
-                                       block_token_ids, None)
+                                       block_token_ids,
+                                       salt_keys if start == 0 else None)
         ret.append(block_hash)
         parent_block_hash_value = block_hash.hash_value
     return ret
