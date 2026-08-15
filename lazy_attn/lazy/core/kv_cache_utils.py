@@ -5,14 +5,14 @@ Changed by Haocheng at 2025/09/07
 from typing import Any
 
 from vllm.v1.core.kv_cache_utils import need_extra_keys, generate_block_hash_extra_keys, hash_block_tokens
-from vllm.v1.core.kv_cache_utils import BlockHashType
+from vllm.v1.core.kv_cache_utils import BlockHash
 
 from lazy.request import LazyRequest as Request
 
 
 
 def hash_request_tokens_docs(hash_function: Any, block_size: int,
-                                  request: Request) -> list[list[BlockHashType]]:
+                                  request: Request) -> list[list[BlockHash]]:
     """Compute the hash values for each document in the document sequence.
     Note the the return value is a list of lists, where each inner list contains
     the hash values for a single document."""
@@ -36,7 +36,7 @@ def hash_request_tokens_docs(hash_function: Any, block_size: int,
 
 
 def hash_request_tokens_with_doc_hash(hash_function: Any, block_size: int,
-                                      request: Request) -> list[BlockHashType]:
+                                      request: Request) -> list[BlockHash]:
     """The only difference between this function and the original one is that
     the hash of the document sequence is used as the prefix for the block hash."""
     token_ids = request.all_token_ids
