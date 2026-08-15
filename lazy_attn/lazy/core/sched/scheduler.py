@@ -422,9 +422,16 @@ class LazyScheduler(Scheduler):
                 if (request.has_documents and not just_merged
                         and drop_first_cached_block):
                     # The switch is applied by the per-document lookup below,
-                    # which a resumed request does not reach, so it does not
-                    # apply to this one. Said out loud rather than silently,
-                    # because it changes what an ablation run measures.
+                    # which only a request's *first* pass through here reaches.
+                    # Two things bring a request back for a second pass, and
+                    # neither is rare under memory pressure: preemption, and a
+                    # merge whose scheduling attempt then failed (allocate_slots
+                    # returning None, or encoder scheduling zeroing
+                    # num_new_tokens). Either way the documents now come from
+                    # the ordinary prefix-cache hit with their first blocks
+                    # included, so the switch does not apply to this request.
+                    # Said out loud rather than silently, because it changes
+                    # what an ablation run measures.
                     #
                     # Not worked around by dropping the prefix hit: that would
                     # prefill the merged [doc0, doc1, ..., query] sequence, and
@@ -438,10 +445,15 @@ class LazyScheduler(Scheduler):
                     # affected documents as standalone document requests.
                     logger.warning(
                         "MEPIC_FIRST_BLOCK_RECOMPUTE does not apply to request "
-                        "%s: it was preempted, and on resume its documents come "
-                        "from the ordinary prefix-cache hit. Give the engine "
-                        "enough KV cache to avoid preemption if the ablation "
-                        "has to cover every request.", request.request_id)
+                        "%s: %s, so its documents come from the ordinary "
+                        "prefix-cache hit, first blocks included. Give the "
+                        "engine enough KV cache that neither happens if the "
+                        "ablation has to cover every request.",
+                        request.request_id,
+                        "it was preempted and resumed"
+                        if request.status == RequestStatus.PREEMPTED else
+                        "it merged its documents on an earlier scheduling "
+                        "attempt that then could not allocate blocks")
 
                 if just_merged:
                     # Case 2 -> Case 1.2
