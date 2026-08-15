@@ -70,10 +70,24 @@ class Shape:
     head_size: int
 
 
+# The decode kernel is launched per (sequence, kv head) and its tile is
+# [max(next_pow2(query_heads // kv_heads), 16), head_size] -- so what a shape
+# costs in registers is set by head_size and by the GQA group size *once the
+# group exceeds 16*, not by parameter count. Llama-3 8B/70B/405B all land on
+# head_size=128 and a group of 4/8/16, i.e. the same compiled kernel; `70B` is
+# here to make that checkable rather than asserted. The last two are the shapes
+# that do move the register pressure.
 SHAPES = [
     Shape("1B", num_query_heads=32, num_kv_heads=8, head_size=64),
     Shape("8B", num_query_heads=32, num_kv_heads=8, head_size=128),
+    Shape("70B", num_query_heads=64, num_kv_heads=8, head_size=128),
+    Shape("hs256", num_query_heads=32, num_kv_heads=8, head_size=256),
+    Shape("mqa32", num_query_heads=32, num_kv_heads=1, head_size=128),
 ]
+
+# The full sweep stays on the two shapes the project actually runs; the rest are
+# opt-in via --shapes.
+DEFAULT_SHAPES = ["1B", "8B"]
 
 
 @dataclass
@@ -362,8 +376,8 @@ def main() -> int:
     parser.add_argument("--context-lens", type=int, nargs="+",
                         default=[1024, 4096, 16384])
     parser.add_argument("--doc-lens", type=int, nargs="+", default=[128, 1024])
-    parser.add_argument("--shapes", nargs="+",
-                        default=[shape.name for shape in SHAPES])
+    parser.add_argument("--shapes", nargs="+", default=DEFAULT_SHAPES,
+                        choices=[shape.name for shape in SHAPES])
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--reps", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=10)

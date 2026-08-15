@@ -267,6 +267,34 @@ so trading table loads for arithmetic *raises* occupancy 17% → 25% — which i
 the sign flips there, and only once the batch is large enough to have the warps to
 schedule.
 
+**It does not keep getting better on bigger models.** The natural reading of the
+table above is "compute wins as the model grows", and that is not what happens.
+The kernel is launched per (sequence, KV head) with a
+`[max(next_pow2(query_heads / kv_heads), 16), head_size]` tile, so its register
+pressure is set by `head_size` and by the GQA group *once the group exceeds 16* —
+not by parameter count. Llama-3 8B, 70B and 405B all have `head_size=128` and
+groups of 4/8/16, i.e. **the same compiled kernel**; a bigger model just calls it
+more times. Measured at 4096 context (`--shapes` in the benchmark):
+
+| shape | regs load → compute | 32 seqs | 128 seqs | 256 seqs |
+|---|---|---|---|---|
+| 8B (hs 128, group 4)   | 208 → 168 | 1.22× | 0.88× | 0.93× |
+| 70B (hs 128, group 8)  | 208 → 165 | 1.19× | 0.89× | 0.92× |
+| hs 256 (group 4)       | 253 → 255 | 0.97× | 0.98× | 0.99× |
+| MQA (hs 128, group 32) | 255 → 234 | 0.92× | 0.92× | 0.94× |
+
+70B reproduces 8B exactly, as predicted. Doubling `head_size` to 256 does *not*
+continue the trend — it lands at parity (ranges overlap), because there both
+paths sit at 2 blocks/SM and compute can no longer buy occupancy, only pay
+instructions. The win at `head_size=128` exists because that is where the load
+path sits just above an occupancy cliff that compute drops it below; away from
+that cliff, in either direction, the benefit disappears.
+
+The MQA row is the exception the occupancy model does not explain — compute wins
+6–8% with blocks/SM unchanged. With one KV head the grid is only `num_seqs`
+programs across 70 SMs, so that kernel is latency-bound rather than
+occupancy-bound; it has not been investigated further.
+
 Two things came out of this analysis and are now in the code:
 
 * **The frequency table is hoisted out of the block loop.** `rope_freqs` (the
