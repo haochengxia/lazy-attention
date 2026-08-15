@@ -237,15 +237,17 @@ below are on an RTX 5070 Ti (sm_120), torch 2.7.0+cu128 / triton 3.4.0, bf16,
 block size 16.
 
 **Compute loses almost everywhere.** Across 36 cases (1–32 seqs × 1k/4k/16k
-context × 128/1024-token documents × two head sizes) compute is slower in 36/36,
-median 1.10× the load time, worst 1.35×.
+context × 128/1024-token documents × two head sizes), 23 separated; compute lost
+all 23, median 1.12× the load time, worst 1.21×. The other 13 are reported as
+inconclusive rather than assigned to whichever median came out lower.
 
-**It wins in exactly one regime:** large-batch decode at `head_size=128`.
+**It wins once the batch is large and the load path is register-bound.** At
+`head_size=128`:
 
 | shape | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
 |---|---|---|---|---|
-| `head_size=64` (1B)  | 1.06–1.09× | 1.05–1.09× | 1.04–1.07× | 1.04–1.06× |
-| `head_size=128` (8B) | 1.19× | 0.98× (tie) | **0.88×** | **0.93×** |
+| `head_size=64` (1B)  | 1.10× | 1.07× | 1.05× | 1.05× |
+| `head_size=128` (8B) | 1.20× | 0.98× (overlapping) | **0.87×** | **0.91×** |
 
 (context 4096; `<1` means compute is faster. Ranges separate except at 64 seqs.)
 
@@ -273,27 +275,30 @@ The kernel is launched per (sequence, KV head) with a
 `[max(next_pow2(query_heads / kv_heads), 16), head_size]` tile, so its register
 pressure is set by `head_size` and by the GQA group *once the group exceeds 16* —
 not by parameter count. Llama-3 8B, 70B and 405B all have `head_size=128` and
-groups of 4/8/16, i.e. **the same compiled kernel**; a bigger model just calls it
-more times. Measured at 4096 context (`--shapes` in the benchmark):
+groups of 4/8/16, so they land on the **same tile and the same register budget**;
+Triton still compiles a specialization per group, but nothing that moves this
+trade-off differs between them. A bigger model just calls the kernel more times.
+Measured at 4096 context (`--shapes` in the benchmark):
 
-| shape | regs load → compute | 32 seqs | 128 seqs | 256 seqs |
-|---|---|---|---|---|
-| 8B (hs 128, group 4)   | 208 → 168 | 1.22× | 0.88× | 0.93× |
-| 70B (hs 128, group 8)  | 208 → 165 | 1.19× | 0.89× | 0.92× |
-| hs 256 (group 4)       | 253 → 255 | 0.97× | 0.98× | 0.99× |
-| MQA (hs 128, group 32) | 255 → 234 | 0.92× | 0.92× | 0.94× |
+| shape | regs load → compute | 32 seqs | 64 seqs | 128 seqs | 256 seqs |
+|---|---|---|---|---|---|
+| 8B (hs 128, group 4)   | 208 → 168 | 1.20× | 0.98× | 0.87× | 0.91× |
+| 70B (hs 128, group 8)  | 208 → 165 | 1.18× | 0.97× | 0.88× | 0.91× |
+| hs 256 (group 4)       | 253 → 255 | 1.02× | 0.99× | 0.98× | 0.98× |
+| MQA (hs 128, group 32) | 255 → 234 | 0.86× | 0.92× | 0.96× | 0.92× |
 
-70B reproduces 8B exactly, as predicted. Doubling `head_size` to 256 does *not*
-continue the trend — it lands at parity (ranges overlap), because there both
-paths sit at 2 blocks/SM and compute can no longer buy occupancy, only pay
-instructions. The win at `head_size=128` exists because that is where the load
-path sits just above an occupancy cliff that compute drops it below; away from
-that cliff, in either direction, the benefit disappears.
+70B tracks 8B to within a percent at every batch size, which is the point.
+Doubling `head_size` to 256 does *not* continue the trend: it flattens to ~2%
+(separated at 128+ seqs, overlapping below), because there both paths sit at 2
+blocks/SM and compute can no longer buy occupancy, only pay instructions. The
+large win at `head_size=128` exists because that is where the load path sits just
+above an occupancy cliff that compute drops it below.
 
 The MQA row is the exception the occupancy model does not explain — compute wins
-6–8% with blocks/SM unchanged. With one KV head the grid is only `num_seqs`
-programs across 70 SMs, so that kernel is latency-bound rather than
-occupancy-bound; it has not been investigated further.
+4–14% at *every* batch size, blocks/SM unchanged. With one KV head the grid is
+only `num_seqs` programs across 70 SMs, so that kernel is latency-bound rather
+than occupancy-bound; it has not been investigated further, and the load path
+there is the one that spills.
 
 Two things came out of this analysis and are now in the code:
 
@@ -301,15 +306,20 @@ Two things came out of this analysis and are now in the code:
   `pow`, plus the Llama-3 smoothing on top of it) is position-independent, so it
   is evaluated once per program and only `cos/sin(position × freqs)`
   (`rope_cos_sin_from_freqs`) stays in the loop. On the 1B shape this cut 168 → 128
-  registers and restored compute's occupancy from 25% back to load's 33%, moving
-  the median penalty from 1.17× to 1.10× and the worst case from 1.83× to 1.35×.
+  registers and restored compute's occupancy from 25% back to load's 33%, taking
+  the worst case from 1.83× to 1.21×. It is unconditional — a program evaluates
+  the frequencies even if every offset turns out to be a sentinel and no cos/sin
+  is ever needed — and that is still the faster arrangement: on a context of one
+  document (zero rotations) the hoisted kernel runs 1.06× load at 32 seqs where
+  the in-loop version runs 1.53×. The register pressure costs more than the
+  arithmetic.
 * **The default stays LOAD**, since the shapes where it loses are the common ones.
 
 **None of this was resolvable end to end**, which is the number that would
 actually justify flipping the flag in production. On Llama-3.2-1B (the shape that
 loses at kernel level) the two are a wash after the hoist: 7480 vs 7384 tok/s,
 overlapping ranges. On Llama-3.2-3B — `head_size=128`, i.e. the shape that wins
-8–12% at kernel level — at 256 prompts and `max_num_seqs=256`, two runs of the
+9–13% at kernel level — at 256 prompts and `max_num_seqs=256`, two runs of the
 identical configuration gave **+2.5% and −6.3%**, both with overlapping ranges.
 Decode attention is a slice of the step, and here the slice is smaller than the
 run-to-run noise. Treat the kernel result as a reason to *measure* on a

@@ -196,11 +196,20 @@ runs; each becomes a Triton constexpr, so a new value compiles a new kernel.
 > (which is what `scripts/validate_lazy.py` and the `baseline` benchmark SUT do).
 
 > **`LAZY_DECODE_COMPUTE_COS_SIN` is not a free win.** Measured on an RTX 5070 Ti,
-> computing cos/sin in-kernel is slower in 36/36 kernel sweep cases (median 1.10×,
-> worst 1.35×) because it spills registers. It wins — 8–12% *on that kernel* —
-> only for large-batch decode (≥128 sequences) at `head_size=128`, which is most
-> production Llama serving; it is a property of the head size and the batch, not
-> of model size (70B compiles to the same kernel as 8B).
+> computing cos/sin in-kernel lost every conclusive case of the default sweep
+> (23 of 36 separated; median 1.12×, worst 1.21×) because it spills registers.
+> Where it wins depends on the attention shape, not on model size — 70B behaves
+> like 8B:
+>
+> | attention shape | when compute wins |
+> |---|---|
+> | `head_size=64` (e.g. Llama-3.2-1B) | never measured; 1.05–1.18× slower |
+> | `head_size=128`, GQA (8B, 70B, 405B) | ≥128 concurrent sequences, by 9–13% |
+> | `head_size=256` | ~2% at ≥128 sequences; below that, inconclusive |
+> | MQA (one KV head) | every batch size tested, by 4–14% |
+>
+> The pattern is whether the *load* path is already register-bound: at
+> `head_size=64` it fits in 128 registers and there is no occupancy left to buy.
 >
 > **That kernel win did not show up end to end**, though: on a `head_size=128`
 > model at 256 concurrent requests, two runs of the same configuration gave +2.5%

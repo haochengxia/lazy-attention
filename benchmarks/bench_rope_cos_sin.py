@@ -90,6 +90,15 @@ SHAPES = [
 DEFAULT_SHAPES = ["1B", "8B"]
 
 
+# q_offset occupies 16 bits of the packed block table, so a rotation offset
+# beyond this would run into the physical-block field.
+MAX_PACKED_Q_OFFSET = 0xFFFF
+# bfloat16 keeps ~8 mantissa bits. The load path rounds cos/sin through a bf16
+# table and the compute path does not, so they differ at about this level; more
+# than this is a bug rather than rounding.
+BF16_TOLERANCE = 1e-2
+
+
 @dataclass
 class Case:
     shape: Shape
@@ -97,14 +106,55 @@ class Case:
     context_len: int
     doc_len: int
 
+    def validate(self) -> None:
+        """Reject shapes the packed-table model cannot represent honestly.
+
+        Each is a case where the benchmark would still run and still print a
+        number, but the number would describe something other than the label.
+        """
+        if self.context_len % BLOCK_SIZE:
+            raise ValueError(
+                f"--context-lens must be a multiple of {BLOCK_SIZE}, got "
+                f"{self.context_len}: the cache and the packed table would be "
+                f"sized by flooring while the kernel walks ceil(seq_len / "
+                f"{BLOCK_SIZE}) blocks, reading past both.")
+        if self.doc_len % BLOCK_SIZE:
+            raise ValueError(
+                f"--doc-lens must be a multiple of {BLOCK_SIZE}, got "
+                f"{self.doc_len}: documents are padded to whole blocks by the "
+                f"scheduler, so an unaligned length would advance positions by "
+                f"{self.doc_len} while changing offset every "
+                f"{max(self.doc_len // BLOCK_SIZE, 1)} block(s) -- a "
+                f"combination the real metadata never produces.")
+        if self.max_q_offset > MAX_PACKED_Q_OFFSET:
+            raise ValueError(
+                f"context {self.context_len} with {self.doc_len}-token "
+                f"documents needs a rotation offset of {self.max_q_offset}, "
+                f"past the {MAX_PACKED_Q_OFFSET} the packed table's 16-bit "
+                f"field holds; the excess bits would land in the block index.")
+
     @property
     def blocks_per_seq(self) -> int:
         return self.context_len // BLOCK_SIZE
 
     @property
-    def rotations_per_seq(self) -> int:
-        """How often the kernel must fetch a new cos/sin pair."""
+    def num_docs(self) -> int:
         return max(self.context_len // self.doc_len, 1)
+
+    @property
+    def max_q_offset(self) -> int:
+        """Largest +1-biased offset this case puts in the packed table."""
+        return (self.num_docs - 1) * self.doc_len + 1 + self.num_seqs - 1
+
+    @property
+    def rotations_per_seq(self) -> int:
+        """How many cos/sin pairs the kernel actually evaluates per sequence.
+
+        The first document's offset is the `1` reset sentinel, which the kernel
+        satisfies from Q_full without touching cos/sin -- so it is one fewer
+        than the document count, and a single-document context evaluates none.
+        """
+        return max(self.num_docs - 1, 0)
 
 
 @dataclass
@@ -165,15 +215,26 @@ def build_inputs(case: Case, device: torch.device):
                              dtype=torch.int64,
                              device=device).view(num_seqs,
                                                  case.blocks_per_seq)
-    blocks_per_doc = max(case.doc_len // BLOCK_SIZE, 1)
+    blocks_per_doc = case.doc_len // BLOCK_SIZE
     doc_index = (torch.arange(case.blocks_per_seq, device=device) //
                  blocks_per_doc)
     # Rotation offsets grow per document, +1-biased, as the scheduler emits
-    # them; the exact values do not change the work, only how often it changes.
+    # them. Sequences are given *different* absolute offsets: a single row
+    # broadcast to every sequence would have the whole batch reading the same
+    # handful of cos_sin_cache rows, which is an L2 hit rate the load path
+    # would not get in a real batch -- the same reason the KV blocks above are
+    # distinct per sequence. Document 0 keeps the `1` reset sentinel for every
+    # sequence, so the number of rotations per sequence stays exactly
+    # `case.rotations_per_seq` and only the addresses differ.
     q_offset = (doc_index * case.doc_len + 1).to(torch.int64)
-    q_offset = q_offset.clamp(max=ROPE_MAX_POSITION - 1)
+    q_offset = q_offset.unsqueeze(0).repeat(num_seqs, 1)
+    seq_shift = torch.arange(num_seqs, dtype=torch.int64,
+                             device=device).unsqueeze(1)
+    q_offset = torch.where(doc_index.unsqueeze(0) == 0, q_offset,
+                           q_offset + seq_shift)
+    assert int(q_offset.max()) <= MAX_PACKED_Q_OFFSET  # Case.validate()
     q_mask = torch.zeros_like(q_offset)
-    packed = (block_ids << 32) | (q_offset.unsqueeze(0) << 16) | q_mask
+    packed = (block_ids << 32) | (q_offset << 16) | q_mask
 
     rope = Llama3RotaryEmbedding(head_size=shape.head_size,
                                  rotary_dim=shape.head_size,
@@ -226,8 +287,8 @@ def build_inputs(case: Case, device: torch.device):
         rotary_dim_pow2=triton.next_power_of_2(shape.head_size),
         is_neox_style=True,
         is_lazy_ptr=torch.ones(num_seqs, dtype=torch.bool, device=device),
-        q_offset_ptr=q_offset.to(torch.int32).unsqueeze(0).repeat(num_seqs, 1),
-        q_mask_ptr=q_mask.to(torch.int32).unsqueeze(0).repeat(num_seqs, 1),
+        q_offset_ptr=q_offset.to(torch.int32),
+        q_mask_ptr=q_mask.to(torch.int32),
         cos_sin_cache_ptr=rope.cos_sin_cache,
         IGNORE_Q_MASK=False,
         **rope_meta_from_layer(rope),
@@ -272,6 +333,19 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int) -> dict:
         outputs[compute] = kwargs["output_ptr"].clone().float()
     diff = (outputs[False] - outputs[True]).abs()
     scale = outputs[False].abs().max().clamp(min=1e-6)
+    # A timing comparison between two paths that disagree is meaningless, so
+    # this fails the run rather than printing the discrepancy underneath a
+    # performance conclusion. The bound is bf16's own resolution: the two paths
+    # are not expected to be bit-identical (one rounds through a bf16 table),
+    # only to agree to within it.
+    rel_diff = (diff.max() / scale).item()
+    if rel_diff > BF16_TOLERANCE:
+        raise AssertionError(
+            f"load and compute disagree by {rel_diff:.3e} relative "
+            f"({diff.max().item():.3e} absolute) on {case.shape.name} "
+            f"seqs={case.num_seqs} ctx={case.context_len} doc={case.doc_len}, "
+            f"past the {BF16_TOLERANCE:.0e} bf16 tolerance -- this is a "
+            f"correctness regression, not a benchmark result.")
 
     timings = {False: Timing(), True: Timing()}
     for rep in range(reps):
@@ -323,7 +397,14 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
     import os
     import time
 
-    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # Must be in-process. The A/B flips LAZY_DECODE_COMPUTE_COS_SIN between
+    # rounds and the kernel reads it per call; with a worker process the engine
+    # forks before those mutations and both labelled variants would silently
+    # run whichever value the worker inherited.
+    if os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") not in (None, "0"):
+        print("note: forcing VLLM_ENABLE_V1_MULTIPROCESSING=0 -- the per-round "
+              "switch does not reach a worker process")
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     import lazy.__vllm__  # noqa: F401  patches vLLM
     from vllm import LLM, SamplingParams
 
@@ -432,6 +513,8 @@ def main() -> int:
             shapes, args.num_seqs, args.context_lens, args.doc_lens)
         if doc_len <= context_len
     ]
+    for case in cases:
+        case.validate()
 
     header = (f"{'shape':>5} {'seqs':>5} {'ctx':>6} {'doc':>5} {'rot':>5} "
               f"{'load ms':>9} {'compute ms':>11} {'ratio':>7} {'sep':>4} "
@@ -451,11 +534,23 @@ def main() -> int:
               f"{'yes' if result['separated'] else 'no':>4} "
               f"{result['max_abs_diff']:>9.2e}")
 
-    ratios = [result["ratio"] for result in results]
-    print(f"\ncompute/load ratio: median {statistics.median(ratios):.3f}, "
-          f"min {min(ratios):.3f}, max {max(ratios):.3f}")
-    print(f"cases where compute wins: "
-          f"{sum(1 for ratio in ratios if ratio < 1)}/{len(ratios)}")
+    # Only cases whose timing ranges separate get a verdict. Counting a case
+    # whose ranges overlap as a win for whichever median came out lower is how
+    # noise gets reported as a result -- the rule this benchmark states in its
+    # docstring, applied to its own summary.
+    decided = [result for result in results if result["separated"]]
+    undecided = len(results) - len(decided)
+    if decided:
+        ratios = [result["ratio"] for result in decided]
+        print(f"\ncompute/load ratio over the {len(decided)} decided case(s): "
+              f"median {statistics.median(ratios):.3f}, min {min(ratios):.3f}, "
+              f"max {max(ratios):.3f}")
+        print(f"compute wins {sum(1 for r in ratios if r < 1)}, "
+              f"load wins {sum(1 for r in ratios if r > 1)}")
+    else:
+        print("\nno case separated: nothing measured here is conclusive")
+    if undecided:
+        print(f"inconclusive (ranges overlap): {undecided}/{len(results)}")
     # Registers are a property of the compiled kernel, i.e. of the shape -- not
     # of the batch -- so report one line per shape rather than one for the run.
     seen = set()
