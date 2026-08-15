@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 
 from vllm.logger import init_logger
+from vllm.v1.request import RequestStatus
 
 from lazy.core.sched.scheduler import LazyScheduler
 
@@ -28,6 +29,8 @@ logger = init_logger(__name__)
 class BlockAttnScheduler(LazyScheduler):
 
     def schedule(self):
+        # Checked before anything is scheduled: see the docstring.
+        self._reject_preempted_lazy_requests()
         # Block-Attention rotates the SHARED document keys before the kernel,
         # which is only valid once the documents have actually been computed in
         # a PRIOR step. The lazy scheduler would otherwise prefill the documents
@@ -41,11 +44,10 @@ class BlockAttnScheduler(LazyScheduler):
         # by this step's forward).
         for req in reversed(deferred):
             self.waiting.appendleft(req)
-        self._reject_resumed_lazy_requests(output)
         self._apply_copy_on_write(output)
         return output
 
-    def _reject_resumed_lazy_requests(self, output) -> None:
+    def _reject_preempted_lazy_requests(self) -> None:
         """Preemption is not supported on this path, and must not be silent.
 
         `_apply_copy_on_write` only walks `scheduled_new_reqs`, so a request
@@ -61,20 +63,29 @@ class BlockAttnScheduler(LazyScheduler):
         say so itself. Fixing it properly means recreating and re-rotating the
         copies for resumed requests, which is worth doing -- this is the
         placeholder that stops it being answered wrongly until then.
+
+        Raised from the waiting queue BEFORE this step schedules anything, not
+        from the finished `SchedulerOutput`. A preempted request sits in
+        `waiting` with `PREEMPTED` status from the step that evicted it until
+        the step that resumes it, so this sees it one full step before the
+        `resumed_from_preemption` flag exists -- and refusing at that point
+        leaves the scheduler untouched. Refusing afterwards would mean unwinding
+        blocks that were already allocated, a request already moved to
+        `running`, and a computed-token count already advanced for a forward
+        pass that will now never run: either an engine-wide crash, or, if the
+        caller catches it, scheduler state describing work that did not happen.
         """
-        cached = output.scheduled_cached_reqs
-        for idx, req_id in enumerate(cached.req_ids):
-            if not cached.resumed_from_preemption[idx]:
-                continue
-            request = self.requests.get(req_id)
-            if request is not None and getattr(request, "has_documents", False):
+        for request in self.waiting:
+            if (request.status == RequestStatus.PREEMPTED
+                    and getattr(request, "has_documents", False)):
                 raise NotImplementedError(
-                    f"Block-Attention cannot resume request {req_id} after "
-                    f"preemption: its rotated document copies were freed and "
-                    f"are not recreated, so it would attend to unrotated keys "
-                    f"with an unrotated query. Give the engine enough KV cache "
-                    f"to avoid preemption (raise gpu_memory_utilization, or "
-                    f"lower max_num_seqs), or run the `lazy` variant.")
+                    f"Block-Attention cannot resume request "
+                    f"{request.request_id} after preemption: its rotated "
+                    f"document copies were freed and are not recreated, so it "
+                    f"would attend to unrotated keys with an unrotated query. "
+                    f"Give the engine enough KV cache to avoid preemption "
+                    f"(raise gpu_memory_utilization, or lower max_num_seqs), "
+                    f"or run the `lazy` variant.")
 
     def _defer_queries_with_uncomputed_docs(self) -> list:
         kept: deque = deque()
