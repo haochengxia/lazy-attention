@@ -78,7 +78,14 @@ class LazyGPUModelRunner(GPUModelRunner):
         device: torch.device,
     ):
         super().__init__(vllm_config, device)
-        
+
+        # vLLM 0.9.x moved max_num_blocks_per_req onto the per-group BlockTable
+        # (block tables became multi-group). The lazy side-buffers below are
+        # indexed like the attention block table, so recompute the same bound
+        # the block table uses for this model.
+        self.max_num_blocks_per_req = cdiv(self.max_model_len,
+                                           self.cache_config.block_size)
+
         # ///////////////////////////
         self.is_lazy_req = torch.zeros(self.max_num_reqs,
                                        dtype=torch.bool,
