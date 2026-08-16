@@ -137,7 +137,7 @@ MEASUREMENT_DIGITS = 3
 
 
 def padding_plan(num_docs: int, seq_idx: int) -> list[int]:
-    """Per-document padding for one sequence: a fixed multiset, rotated.
+    """Per-document padding for one sequence: a fixed multiset, permuted.
 
     Padding is the mechanism the real metadata has for shifting rotation
     offsets -- a document's offset is the total padding plus the true lengths
@@ -146,7 +146,7 @@ def padding_plan(num_docs: int, seq_idx: int) -> list[int]:
     rate no real batch would give it.
 
     They differ in *where* the padding sits, not in how much there is. Every
-    sequence gets the same multiset, rotated by `seq_idx`, so all of them have
+    sequence gets the same multiset in a different order, so all of them have
     the same total true context length, the same block layout, and the same
     number of rotations; only the offsets move. Scaling one pad value with
     `seq_idx` instead (the earlier version) changed the true length per
@@ -423,6 +423,31 @@ def launch(kwargs, compute_cos_sin: bool, num_seqs: int, num_kv_heads: int,
                                             COMPUTE_COS_SIN=compute_cos_sin)
 
 
+def kernel_metadata(compiled, case: Case, label: str) -> tuple[int, int]:
+    """`n_regs` / `n_spills` off a compiled kernel, or a loud failure.
+
+    On the pinned Triton (3.4) an ordinary `kernel[grid](...)` launch returns
+    the `CompiledKernel`, so the warmup launches already hand back everything
+    needed -- checked on this environment, where the load path reports 208
+    registers and 0 spills on the 8B shape. Should a future version return
+    something else, reading these with a `None` default would print `None` in
+    the register line and quietly withdraw the evidence for the occupancy
+    argument this whole benchmark rests on, while still printing timings that
+    look complete. So it raises instead: use `kernel.warmup(...)` to obtain the
+    compiled object explicitly if that day comes.
+    """
+    n_regs = getattr(compiled, "n_regs", None)
+    n_spills = getattr(compiled, "n_spills", None)
+    if n_regs is None or n_spills is None:
+        raise RuntimeError(
+            f"launching {case.shape.name}/{label} returned "
+            f"{type(compiled).__name__}, which carries no n_regs/n_spills; "
+            f"the register and occupancy numbers this benchmark reports come "
+            f"from there, so it stops rather than reporting them as None "
+            f"(triton {triton.__version__})")
+    return n_regs, n_spills
+
+
 def time_variant(kwargs, compute_cos_sin, case, iters, kernel) -> float:
     """Mean ms per launch over `iters`, measured with CUDA events."""
     start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
@@ -510,6 +535,10 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int,
     # distinct KV blocks and the per-sequence padding plans exist to avoid.
     distinct_traces = len({tuple(row) for row in offsets.tolist()})
 
+    load_regs, load_spills = kernel_metadata(compiled[False], case, "load")
+    compute_regs, compute_spills = kernel_metadata(compiled[True], case,
+                                                   "compute")
+
     load, comp = timings[False], timings[True]
     result = dict(
         shape=case.shape.name,
@@ -528,14 +557,8 @@ def run_case(case: Case, device, iters: int, reps: int, warmup: int,
         separated=load.hi < comp.lo or comp.hi < load.lo,
         max_abs_diff=diff.max().item(),
         max_rel_diff=(diff.max() / scale).item(),
-        regs={
-            "load": getattr(compiled[False], "n_regs", None),
-            "compute": getattr(compiled[True], "n_regs", None),
-        },
-        spills={
-            "load": getattr(compiled[False], "n_spills", None),
-            "compute": getattr(compiled[True], "n_spills", None),
-        },
+        regs={"load": load_regs, "compute": compute_regs},
+        spills={"load": load_spills, "compute": compute_spills},
     )
     del kwargs, outputs
     torch.cuda.empty_cache()
@@ -673,13 +696,30 @@ def run_e2e(model: str, rounds: int, max_tokens: int, num_prompts: int,
     return 0
 
 
+def positive_int(value: str) -> int:
+    """A count that must actually count something.
+
+    Zero is accepted by `int` and breaks a different part of the run in each
+    case -- `--iters 0` divides by zero in `time_variant`, `--reps 0` leaves the
+    timing lists empty for `statistics.median`, `--warmup 0` leaves no compiled
+    kernel to read registers off, `--e2e-rounds 0` runs only the warmup round --
+    each after the inputs are allocated and the kernels compiled. Rejected at
+    parse time instead.
+    """
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {parsed}")
+    return parsed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-seqs", type=int, nargs="+",
+    parser.add_argument("--num-seqs", type=positive_int, nargs="+",
                         default=[1, 8, 32])
-    parser.add_argument("--context-lens", type=int, nargs="+",
+    parser.add_argument("--context-lens", type=positive_int, nargs="+",
                         default=[1024, 4096, 16384])
-    parser.add_argument("--doc-lens", type=int, nargs="+", default=[128, 1024])
+    parser.add_argument("--doc-lens", type=positive_int, nargs="+",
+                        default=[128, 1024])
     parser.add_argument("--shapes", nargs="+", default=DEFAULT_SHAPES,
                         choices=[shape.name for shape in SHAPES])
     parser.add_argument("--rope", nargs="+", default=ROPE_KINDS,
@@ -690,21 +730,21 @@ def main() -> int:
                         choices=list(KERNELS),
                         help="decode kernel: the mixed one, or the lazy-only "
                              "one LAZY_FORCE_SPLIT_DECODE selects")
-    parser.add_argument("--iters", type=int, default=50)
-    parser.add_argument("--reps", type=int, default=7)
-    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iters", type=positive_int, default=50)
+    parser.add_argument("--reps", type=positive_int, default=7)
+    parser.add_argument("--warmup", type=positive_int, default=10)
     parser.add_argument("--quick", action="store_true",
                         help="one representative case")
     parser.add_argument("--json", type=str, default=None)
     parser.add_argument("--e2e", action="store_true",
                         help="model-level A/B instead of the kernel sweep")
     parser.add_argument("--e2e-model", default="hxia7/Llama-3.2-1B-Block-FT")
-    parser.add_argument("--e2e-rounds", type=int, default=4)
-    parser.add_argument("--e2e-max-tokens", type=int, default=128)
+    parser.add_argument("--e2e-rounds", type=positive_int, default=4)
+    parser.add_argument("--e2e-max-tokens", type=positive_int, default=128)
     # Defaulted to the concurrency limit: a smaller number silently
     # measures a small-batch run under a large-batch label.
-    parser.add_argument("--e2e-prompts", type=int, default=256)
-    parser.add_argument("--e2e-max-num-seqs", type=int, default=256)
+    parser.add_argument("--e2e-prompts", type=positive_int, default=256)
+    parser.add_argument("--e2e-max-num-seqs", type=positive_int, default=256)
     parser.add_argument("--e2e-gpu-util", type=float, default=0.6)
     args = parser.parse_args()
 
