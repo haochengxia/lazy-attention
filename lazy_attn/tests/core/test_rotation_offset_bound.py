@@ -1,4 +1,4 @@
-"""What the packed block table's 16-bit q_offset field can hold.
+"""What the packed block table's 24-bit q_offset field can hold.
 
 The bound is easy to state wrongly. It is *not* "documents under 64k tokens":
 document `d` rotates by the total padding plus the true lengths of the documents
@@ -55,13 +55,32 @@ def test_one_huge_document_is_offset_one():
 
 @pytest.mark.unit
 def test_many_documents_reach_the_limit():
-    lens = [1024] * 64  # 65536 tokens ahead of the last one
+    lens = [1024] * 16384  # 16M tokens ahead of the last one
     padded = list(lens)
 
-    assert max_rotation_offset(lens, padded) == 1024 * 63 + 1
+    assert max_rotation_offset(lens, padded) == 1024 * 16383 + 1
+    _validate_rotation_offsets(lens, padded)  # accepted
 
     with pytest.raises(ValueError, match="past the"):
-        _validate_rotation_offsets([1024] * 65, [1024] * 65)
+        _validate_rotation_offsets([1024] * 16385, [1024] * 16385)
+
+
+@pytest.mark.unit
+def test_the_corpus_as_cache_regime_admits():
+    """What the 16-bit field refused and the 24-bit one has to accept.
+
+    65 documents of 1k tokens overflowed the old field, which put the cap
+    below every large-M experiment: hundreds of cached documents is the
+    workload the reusable cache exists for.
+    """
+    lens = [1024] * 65
+    assert max_rotation_offset(lens, lens) > 0xFFFF  # refused before
+    _validate_rotation_offsets(lens, lens)
+
+    # Padding is what bites first when the documents are short.
+    ragged = [700] * 512
+    padded = [704] * 512
+    _validate_rotation_offsets(ragged, padded)
 
 
 @pytest.mark.unit

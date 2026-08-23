@@ -113,9 +113,12 @@ SHAPES = [
 DEFAULT_SHAPES = ["1B", "8B"]
 
 
-# q_offset occupies 16 bits of the packed block table, so a rotation offset
-# beyond this would run into the physical-block field.
-MAX_PACKED_Q_OFFSET = 0xFFFF
+# q_offset occupies 24 bits of the packed block table, so a rotation offset
+# beyond this would run into the physical-block field. Kept in sync with
+# lazy/utils/rotation.py, which this benchmark does not import (it runs the
+# kernel standalone, without the engine).
+MAX_PACKED_Q_OFFSET = 0xFFFFFF
+PACKED_Q_OFFSET_SHIFT = 8
 # What the agreement check can and cannot see. The load path rounds cos/sin
 # through a bf16 table, giving a relative error of ~2**-9 on the rotated Q;
 # that propagates through the scores and softmax into an absolute output error
@@ -346,7 +349,7 @@ def build_inputs(case: Case, device: torch.device, rope_kind: str = "llama3"):
     q_offset = torch.tensor(q_offset_rows, dtype=torch.int64, device=device)
     q_mask = torch.tensor(q_mask_rows, dtype=torch.int64, device=device)
     assert int(q_offset.max()) <= MAX_PACKED_Q_OFFSET  # Case.validate()
-    packed = (block_ids << 32) | (q_offset << 16) | q_mask
+    packed = (block_ids << 32) | (q_offset << PACKED_Q_OFFSET_SHIFT) | q_mask
 
     # Which RoPE the model uses is a compile-time branch in the kernel, not a
     # parameter: ROPE_TYPE=0 compiles the Llama-3 smoothing (a wavelength

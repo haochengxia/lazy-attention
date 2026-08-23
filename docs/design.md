@@ -402,23 +402,35 @@ The decode kernel needs three numbers per block: physical block index, `q_offset
 inside the group that allocated it — with all three packed:
 
 ```
-[ physical_block_idx : 32 | q_offset : 16 | q_mask : 16 ]
+[ physical_block_idx : 32 | q_offset : 24 | q_mask : 8 ]
 ```
 
 Each layer is handed the table for its own group (`layer_name → group`); the
-rotation tensors beside it are group-independent and shared.
+rotation tensors beside it are group-independent and shared. The field widths
+live in `lazy/utils/rotation.py`, which the runner, the admission check and the
+kernel all read, so the layout is stated once.
 
-Sixteen bits caps `q_offset` at **65535**. What that bounds is not the size of a
-request's document region, and reading it that way gets the constraint wrong in
-both directions. From §4.2, the largest offset a request emits is
+The split was 16/16 until the fields were rebalanced. They are not symmetric
+quantities: `q_mask` holds a document's padding, which is at most
+`block_size - 1` and so needs 8 bits for every block size vLLM offers (a block
+size above 256 is refused in `initialize_kv_cache`), while `q_offset`
+accumulates across documents and was the binding constraint.
+
+Twenty-four bits caps `q_offset` at **16777215**. What that bounds is not the
+size of a request's document region, and reading it that way gets the
+constraint wrong in both directions. From §4.2, the largest offset a request
+emits is
 
 ```
     total padding + (every document's true length except the last) + 1
 ```
 
 so a *single* block-aligned document is offset 1 however long it is, while many
-small documents accumulate — 65 documents of 1024 tokens do not fit, one document
-of 260k does. Requests past the bound are refused at admission
+small documents accumulate — 16385 documents of 1024 tokens do not fit, one
+document of 260k does. At 16 bits the same arithmetic refused 65 documents of
+1024 tokens, i.e. capped a request's reusable cache at ~64k tokens, which sat
+below the corpus-as-cache workloads the reuse exists for. Requests past the
+bound are refused at admission
 (`LazyProcessor.process_inputs`), where it costs that one request rather than the
 engine; the model runner restates the check where the packing happens, for
 anything that reached it another way. The alternative is not a smaller error: the
@@ -553,8 +565,9 @@ out of every score by `q_mask`.
   unsupported upstream on this path.
 * **KV cache groups** must all use the scheduler's block size — the rotation
   metadata is per block at one block size. Each group gets its own packed block
-  table; a group on a different block size is refused.
-* **Rotation offset ≤ 65535 per request**, the packed block table's 16-bit
+  table; a group on a different block size is refused. **Block size ≤ 256**, the
+  packed table's 8-bit `q_mask` field.
+* **Rotation offset ≤ 16777215 per request**, the packed block table's 24-bit
   `q_offset` field (§4.4) — that is `total padding + every document's length but
   the last + 1`, so it bounds the documents *ahead of* the last one, not document
   size. Refused at admission, not clamped.

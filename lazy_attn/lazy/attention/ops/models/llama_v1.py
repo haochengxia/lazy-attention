@@ -8,6 +8,17 @@ import triton
 import triton.language as tl
 
 from lazy.model_executor.rope import rope_cos_sin_from_freqs, rope_freqs
+from lazy.utils.rotation import (MAX_PACKED_Q_MASK, MAX_PACKED_Q_OFFSET,
+                                 PACKED_Q_OFFSET_SHIFT)
+
+# The unpack below reads these as compile-time constants, so the layout --
+# [physical_block_idx:32 | q_offset:24 | q_mask:8] -- stays defined in exactly
+# one place (lazy/utils/rotation.py) at no cost in the kernel. They have to be
+# *instantiated* as constexpr: a global annotated `x: tl.constexpr = 42` is
+# rejected by the JIT, only `x = tl.constexpr(42)` is read.
+Q_OFFSET_SHIFT = tl.constexpr(PACKED_Q_OFFSET_SHIFT)
+Q_OFFSET_MASK = tl.constexpr(MAX_PACKED_Q_OFFSET)
+Q_MASK_MASK = tl.constexpr(MAX_PACKED_Q_MASK)
 
 
 @triton.jit
@@ -156,8 +167,8 @@ def kernel_paged_attention_2d_llama(
             
             packed_val = tl.load(block_tables_ptr + block_table_offset + j)
             physical_block_idx = (packed_val >> 32).to(tl.int32)
-            rot_offset_val = ((packed_val >> 16) & 0xFFFF).to(tl.int32)
-            q_mask_val = (packed_val & 0xFFFF).to(tl.int32)
+            rot_offset_val = ((packed_val >> Q_OFFSET_SHIFT) & Q_OFFSET_MASK).to(tl.int32)
+            q_mask_val = (packed_val & Q_MASK_MASK).to(tl.int32)
             if IGNORE_Q_MASK:
                 q_mask_val = 0
 
@@ -547,8 +558,8 @@ def kernel_paged_attention_2d_llama_lazy_only(
     for j in range(0, num_blocks):
         packed_val = tl.load(block_tables_ptr + block_table_offset + j)
         physical_block_idx = (packed_val >> 32).to(tl.int32)
-        rot_offset_val = ((packed_val >> 16) & 0xFFFF).to(tl.int32)
-        q_mask_val = (packed_val & 0xFFFF).to(tl.int32)
+        rot_offset_val = ((packed_val >> Q_OFFSET_SHIFT) & Q_OFFSET_MASK).to(tl.int32)
+        q_mask_val = (packed_val & Q_MASK_MASK).to(tl.int32)
         if IGNORE_Q_MASK:
             q_mask_val = 0
 

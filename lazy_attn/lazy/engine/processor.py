@@ -129,7 +129,7 @@ def _validate_rotation_offsets(document_lens: list[int],
                                document_lens_padded: list[int]) -> None:
     """Reject document sets whose rotation offsets the packed table cannot hold.
 
-    The packed block table gives q_offset 16 bits; past that the shifted value
+    The packed block table gives q_offset 24 bits; past that the shifted value
     carries into the physical-block field and the request is answered against
     the wrong blocks, silently. The model runner keeps the same check as a last
     line of defence, but by then the engine is committed -- raising there takes
@@ -141,7 +141,7 @@ def _validate_rotation_offsets(document_lens: list[int],
         raise ValueError(
             f"LazyAttention cannot serve these documents: they need a rotation "
             f"offset of {needed}, past the {MAX_PACKED_Q_OFFSET} the packed "
-            f"block table's 16-bit field holds. The bound is the total padding "
+            f"block table's 24-bit field holds. The bound is the total padding "
             f"plus the lengths of every document but the last "
             f"(a single document is always offset 1, however long it is), so "
             f"send fewer or shorter leading documents, or inline them in the "

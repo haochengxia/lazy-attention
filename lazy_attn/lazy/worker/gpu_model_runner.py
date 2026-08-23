@@ -62,7 +62,8 @@ logger = init_logger(__name__)
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from lazy.worker.gpu_input_batch import CachedRequestState
 from lazy.attention.backends.flash_attn import FlashAttentionMetadata
-from lazy.utils.rotation import MAX_PACKED_Q_OFFSET
+from lazy.utils.rotation import (MAX_PACKED_BLOCK_SIZE, MAX_PACKED_Q_MASK,
+                                 MAX_PACKED_Q_OFFSET, PACKED_Q_OFFSET_SHIFT)
 from lazy.utils.variants import (lazy_shared_kv_profile_enabled,
                                  lazy_shared_kv_profile_min_reqs,
                                  lazy_packed_block_profile_enabled)
@@ -129,7 +130,7 @@ class LazyGPUModelRunner(GPUModelRunner):
         self.lazy_mask_np = self.lazy_mask_cpu.numpy()
 
         # Persistent packed block tables for the decode kernels, one per KV
-        # cache group. Layout: [physical_block_idx:32 | q_offset:16 | q_mask:16]
+        # cache group. Layout: [physical_block_idx:32 | q_offset:24 | q_mask:8]
         #
         # One table is not enough: block ids are only meaningful within the
         # group that allocated them, so a layer in group 1 handed group 0's
@@ -171,6 +172,16 @@ class LazyGPUModelRunner(GPUModelRunner):
                 f"scheduler's block size ({self.block_size}); found "
                 f"{odd}. The per-block rotation metadata is built at one "
                 "block size and cannot address groups that differ.")
+
+        # q_mask holds a document's padding, at most block_size - 1, in the
+        # packed entry's 8-bit field. Above that the padding would carry into
+        # the rotation offset instead of raising anywhere.
+        if self.block_size > MAX_PACKED_BLOCK_SIZE:
+            raise NotImplementedError(
+                f"LazyAttention supports block sizes up to "
+                f"{MAX_PACKED_BLOCK_SIZE}; got {self.block_size}. The packed "
+                f"block table gives q_mask {MAX_PACKED_Q_MASK.bit_length()} "
+                f"bits, and a document's padding can reach block_size - 1.")
 
         block_tables = self.input_batch.block_table
         self.packed_block_tables = [
@@ -220,12 +231,24 @@ class LazyGPUModelRunner(GPUModelRunner):
                         f"Request {req_id} needs a rotation offset of "
                         f"{max(req_state.q_offset)}, past the "
                         f"{MAX_PACKED_Q_OFFSET} the packed block table's "
-                        f"16-bit field holds; it should have been refused at "
+                        f"24-bit field holds; it should have been refused at "
                         f"admission. Packing it would corrupt the physical "
                         f"block index and answer the request wrongly.")
                 self.lazy_offset_np[idx, :len(req_state.q_offset)] = (
                     req_state.q_offset)
             if req_state.q_mask is not None:
+                # The mask field is the narrow one now (8 bits). It holds a
+                # document's padding, so it is bounded by block_size, which
+                # `initialize_kv_cache` refuses above MAX_PACKED_BLOCK_SIZE --
+                # this catches anything that reaches packing another way.
+                if req_state.q_mask and max(
+                        req_state.q_mask) > MAX_PACKED_Q_MASK:
+                    raise ValueError(
+                        f"Request {req_id} carries a document padding of "
+                        f"{max(req_state.q_mask)}, past the "
+                        f"{MAX_PACKED_Q_MASK} the packed block table's 8-bit "
+                        f"q_mask field holds. Packing it would corrupt the "
+                        f"rotation offset and answer the request wrongly.")
                 self.lazy_mask_np[idx, :len(req_state.q_mask)] = req_state.q_mask
 
         self.is_lazy_req[:num_reqs].copy_(self.is_lazy_req_cpu[:num_reqs],
@@ -296,7 +319,7 @@ class LazyGPUModelRunner(GPUModelRunner):
     def _rebuild_packed_block_table(self, num_reqs: int) -> None:
         """Refresh the packed block table consumed by the lazy decode kernels.
 
-        Layout per entry: [physical_block_idx:32 | q_offset:16 | q_mask:16].
+        Layout per entry: [physical_block_idx:32 | q_offset:24 | q_mask:8].
         """
         if not (self._packed_block_table_full_rebuild
                 or self._packed_block_table_delta_rows):
@@ -325,7 +348,8 @@ class LazyGPUModelRunner(GPUModelRunner):
                                          non_blocking=True)
                 packed_block_table.bitwise_left_shift_(32)
                 packed_block_table.bitwise_or_(
-                    lazy_offset[:num_reqs].to(torch.int64) << 16)
+                    lazy_offset[:num_reqs].to(torch.int64)
+                    << PACKED_Q_OFFSET_SHIFT)
                 packed_block_table.bitwise_or_(
                     lazy_mask[:num_reqs].to(torch.int64))
                 rebuilt_rows = num_reqs
@@ -335,7 +359,8 @@ class LazyGPUModelRunner(GPUModelRunner):
                     packed_row.copy_(block_table_dev[row], non_blocking=True)
                     packed_row.bitwise_left_shift_(32)
                     packed_row.bitwise_or_(
-                        lazy_offset[row].to(torch.int64) << 16)
+                        lazy_offset[row].to(torch.int64)
+                        << PACKED_Q_OFFSET_SHIFT)
                     packed_row.bitwise_or_(lazy_mask[row].to(torch.int64))
                 rebuilt_rows = len(delta_rows)
 
