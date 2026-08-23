@@ -159,14 +159,21 @@ def chunked_prefill_paged_decode(
             ROPE_TYPE=0, BASE=10000.0, SCALING_FACTOR=1.0, LOW_FACTOR=1.0,
             HIGH_FACTOR=1.0, ORIG_MAX_POSITION=8192,
             PI_VALUE=3.141592653589793)
-        all_lazy = (is_lazy is not None) and bool(torch.all(is_lazy).item())
+        # `torch.all(is_lazy).item()` is a device-to-host sync, so it is only
+        # asked for when something will use the answer. `force_split_decode` is
+        # off by default, and evaluating it first short-circuits the sync away:
+        # before this, every lazy decode step drained the pipeline once per
+        # layer to compute a boolean it then discarded. It also made the decode
+        # path uncapturable, since a sync is illegal inside a CUDA graph.
+        use_split_decode = (force_split_decode and is_lazy is not None
+                            and bool(torch.all(is_lazy).item()))
         if profile_decode:
             total_start = torch.cuda.Event(enable_timing=True)
             total_end = torch.cuda.Event(enable_timing=True)
             kernel_start = torch.cuda.Event(enable_timing=True)
             kernel_end = torch.cuda.Event(enable_timing=True)
         decode_kernel = (kernel_paged_attention_2d_llama_lazy_only
-                         if force_split_decode and all_lazy
+                         if use_split_decode
                          else kernel_paged_attention_2d_llama)
         # A sparse walk table already carries packed entries, so it supersedes
         # the packed table; without one the dense packed table is used, and
@@ -238,7 +245,7 @@ def chunked_prefill_paged_decode(
             other_ms = max(total_ms - kernel_ms, 0.0)
             print(
                 f"LazyDecodeProfile num_seqs={num_seqs} max_seq_len={max_seq_len} "
-                f"heads={num_query_heads}/{num_kv_heads} split={int(force_split_decode and all_lazy)} "
+                f"heads={num_query_heads}/{num_kv_heads} split={int(use_split_decode)} "
                 f"pack_ms={0.0:.3f} kernel_ms={kernel_ms:.3f} "
                 f"unpack_ms={0.0:.3f} total_ms={total_ms:.3f} other_ms={other_ms:.3f}",
                 flush=True,

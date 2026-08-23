@@ -181,6 +181,37 @@ class Bench:
             print(f"\nrouter adds {total:.1f} ms per decode token "
                   f"({routed} routed layers: 1 cold + {routed - 1} warm)")
 
+    def graph(self) -> None:
+        """Replay `route` from a CUDA graph -- the launch-overhead control.
+
+        A captured graph runs the identical kernels on the identical buffers
+        and differs only in that the CPU no longer issues them one at a time.
+        Whatever the gap between this and the eager number is, that gap was
+        never work; it was dispatch. This is the measurement that says whether
+        fusing the router is worth doing before doing it.
+        """
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                self.router.route(step_cache=self.step, **self.kwargs)
+        torch.cuda.current_stream().wait_stream(stream)
+
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            self.router.route(step_cache=self.step, **self.kwargs)
+
+        eager = _time(
+            lambda: self.router.route(step_cache=self.step, **self.kwargs),
+            self.args.iters)
+        replay = _time(captured.replay, self.args.iters)
+        layers = max(self.args.layers - 2, 1)
+        print(f"\n{'':<22}{'ms/layer':>10}{'ms/token':>11}")
+        print(f"{'eager':<22}{eager:>10.3f}{eager * layers:>11.2f}")
+        print(f"{'cuda graph replay':<22}{replay:>10.3f}{replay * layers:>11.2f}")
+        print(f"\n{eager / max(replay, 1e-9):.1f}x -- everything above 1x was "
+              f"kernel-launch overhead, not work")
+
     def ops(self) -> None:
         """aten-level attribution -- what the phase table cannot decompose."""
         from torch.profiler import ProfilerActivity, profile
@@ -208,10 +239,15 @@ def main() -> int:
     parser.add_argument("--granularity", default="page")
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--ops", action="store_true")
+    parser.add_argument("--graph", action="store_true",
+                        help="replay route() from a CUDA graph, to separate "
+                             "launch overhead from real work")
     args = parser.parse_args()
 
     bench = Bench(args)
     bench.run()
+    if args.graph:
+        bench.graph()
     if args.ops:
         print()
         bench.ops()
