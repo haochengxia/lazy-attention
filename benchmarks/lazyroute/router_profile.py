@@ -226,6 +226,28 @@ class Bench:
         print(prof.key_averages().table(sort_by="self_cuda_time_total",
                                         row_limit=18))
 
+        # The launch budget. "The router is slow" and "the router issues too
+        # many launches" look the same in the phase table above and call for
+        # opposite fixes, so count them: host operations per call, the GPU work
+        # they submit, and the ratio between the two.
+        calls = 20
+        host_ops = cuda_kernels = 0
+        host_us = cuda_us = 0.0
+        for event in prof.key_averages():
+            if event.self_cpu_time_total:
+                host_ops += event.count
+                host_us += event.self_cpu_time_total
+            if event.self_device_time_total:
+                cuda_kernels += event.count
+                cuda_us += event.self_device_time_total
+        print(f"\nper route call: {host_ops / calls:.0f} host ops issuing "
+              f"{cuda_kernels / calls:.0f} CUDA kernels")
+        print(f"                {host_us / calls:.0f} us on the host, "
+              f"{cuda_us / calls:.0f} us on the GPU "
+              f"({host_us / max(cuda_us, 1e-9):.1f}x)")
+        print(f"                {host_us / max(host_ops, 1):.1f} us of host "
+              f"time per op -- the price of one dispatch on this machine")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
