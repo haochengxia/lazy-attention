@@ -1049,14 +1049,33 @@ dies at the same place, so it is not task difficulty either.
 bitsandbytes: fp8 quantises *after* the bf16 weights reach the GPU, so its peak
 is the unquantised 15 GB and it OOMs in the embedding loader, while
 bitsandbytes quantises during load — 5.65 GiB of weights, 7.66 GiB of KV cache,
-62,784 tokens. At 300 documents it answers properly, with the three arms'
-actual output streaming.
+62,784 tokens. At 300 documents it emits fluent, on-topic English, which the
+1B did not.
 
 | arm | TTFT | ms/token | total | answer |
 | --- | ---: | ---: | ---: | --- |
-| vLLM prefix caching | 29,693 ms | 40.7 | 32.15 s | finds Xawery Zulawski |
-| Lazy-Attn | 187 ms | 27.0 | 1.87 s | finds Xawery Zulawski |
+| vLLM prefix caching | 29,693 ms | 40.7 | 32.15 s | names Zulawski, no mother |
+| Lazy-Attn | 187 ms | 27.0 | 1.87 s | names Zulawski, no mother |
 | LazyRoute | 617 ms | 30.1 | 2.50 s | **"is not mentioned"** |
+
+**Correction to the first reading of that table.** "Finds Xawery Zulawski" is
+hop *one*; the gold answer is Malgorzata Braunek, and **no arm produced it,
+dense included** — dense reads all 300 documents and still answers "there is no
+information provided about Xawery Zulawski's parents". Both supporting
+documents are in the corpus (positions 4 and 7 of 300, the second containing
+the name in plain text), so this is the 8B failing a two-hop question over 43k
+tokens, not a missing document. The multi-hop example therefore does not
+discriminate between the arms and should not be the one the demo draws; use
+`--needle`, where correctness is a copied string.
+
+A second example in the same run cuts the other way. On "which film came out
+first, Blind Shaft or The Mask of Fu Manchu", LazyRoute answers correctly *with
+correct dates* (1932 vs 2003) while Lazy-Attn reaches the right conclusion from
+a hallucinated date (1960), and dense spends its budget describing one film
+without comparing. So route is not uniformly worse at a 25% budget — the
+one-example reading above was too harsh, and page-drop shows up as a
+*distribution* of failures rather than a verdict. n=2 supports neither claim
+strongly; the needle task at scale is what would.
 
 **159x to the first token, and on 8B Lazy-Attn also beats dense per token,
 1.51x** — it did not at 1B (0.86x), because thirty-two layers of attention over
