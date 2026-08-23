@@ -83,12 +83,12 @@ are allocated, hashed, evicted or packed.
     LAZY_SPARSE_SCORER            quest (default) | oracle | centroid | random.
                                   oracle runs an auxiliary dense pass and is
                                   for evaluation only.
-    LAZY_SPARSE_ROUTE_LAYERS      all (default) | first | int N. `all` routes
-                                  per layer with that layer's own query, which
-                                  is what Phase 0 measured. `first` routes once
-                                  and shares the decision, which is only sound
-                                  if selection transfers across layers -- an
-                                  ablation, not a default.
+    LAZY_SPARSE_ROUTE_LAYERS      first (default) | all | int N. `first` routes
+                                  once per step and shares the decision down
+                                  the stack; `all` routes per layer with that
+                                  layer's own query, which is what Phase 0
+                                  measured and costs 14x as much for no
+                                  measured gain (§9b).
     LAZY_SPARSE_DENSE_PREFIX_LAYERS  int, default 2. Leading layers left dense
                                   (Quest convention).
     LAZY_SPARSE_REFRESH           every (default) | onchange | int N -- how
@@ -295,15 +295,19 @@ def lazy_sparse_scorer() -> str:
 def lazy_sparse_route_layer_stride() -> int:
     """How often to recompute selection down the layer stack.
 
-    1 (`all`, the default) routes in every sparse layer with that layer's own
-    query -- the object Phase 0 measured. 0 (`first`) routes once and shares
-    the decision with every later layer, which is only sound if selection
-    transfers across layers; that is untested, so it is an ablation arm rather
-    than a default. N routes every N layers.
+    0 (`first`, the default) routes once per step and shares the decision with
+    every later layer. 1 (`all`) routes in every sparse layer with that layer's
+    own query -- the object Phase 0 measured, and 14x the cost. N routes every
+    N layers.
+
+    `first` was an ablation until §9b measured the transfer assumption at
+    n=200: it matches dense on EM and breaks four dense-correct answers to
+    `all`'s seven, so nothing is paid for sharing. Everything is saved -- the
+    router's cost is linear in the call count, at ~3.4 ms each.
     """
     value = os.environ.get("LAZY_SPARSE_ROUTE_LAYERS")
     if value is None or not value.strip():
-        return 1
+        return 0
     value = value.strip().lower()
     if value == "all":
         return 1

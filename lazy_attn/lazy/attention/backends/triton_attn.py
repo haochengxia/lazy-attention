@@ -248,10 +248,13 @@ def forward(
         if ordinal >= router.config.dense_prefix_layers:
             stride = router.config.route_layer_stride
             cached = getattr(attn_metadata, "lazy_walk_table", None)
-            # stride 0 ("first") routes once and shares; stride N routes every
-            # Nth layer and shares in between. Both cache on the step's
-            # metadata object, which every layer in the KV group already shares
-            # and which is rebuilt each step -- so nothing here outlives a step.
+            # stride 0 ("first", the default) routes once per step and shares
+            # the decision with every layer below; stride N routes every Nth
+            # layer and shares in between. Both cache on the step's metadata
+            # object, which every layer in the KV group already shares and
+            # which is rebuilt each step -- so nothing here outlives a step.
+            # This is the one lever on router cost that matters: the cost is
+            # linear in calls, and a call is 477 host dispatches (§9b).
             if cached is not None and (stride == 0 or ordinal % stride):
                 walk = cached
             else:

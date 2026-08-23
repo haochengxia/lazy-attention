@@ -94,11 +94,11 @@ def _configure_env(arm: str, route_layers: str = "4") -> None:
     os.environ.pop("VLLM_WORKER_MULTIPROC_METHOD", None)
     if arm == ROUTE:
         os.environ["LAZY_SPARSE"] = "1"
-        # Routing every layer is a net loss: the router is launch-bound, and a
-        # sparse decode layer leaves only ~1 ms of GPU work to hide ~100 kernel
-        # launches behind. Sharing one decision across a few layers is what
-        # makes the saving visible, and at stride 4 it costs nothing measurable
-        # in answer quality (PROJECT.md 9b).
+        # The router's cost is linear in how many times it is called -- ~3.4 ms
+        # each, almost all of it kernel-launch dispatch rather than arithmetic
+        # -- so the number of calls per step is the only knob that moves it.
+        # `first` is one call, and §9b measured it as costing nothing in answer
+        # quality against routing all fourteen layers.
         os.environ["LAZY_SPARSE_ROUTE_LAYERS"] = route_layers
     else:
         os.environ.pop("LAZY_SPARSE", None)
@@ -329,10 +329,15 @@ def measure(arm: str, args) -> dict:
 def summarise(data: dict) -> dict:
     """Median TTFT and mean inter-token interval across the measured requests.
 
-    Median for TTFT because the first request of a run carries warmup the
-    others do not; mean for ITL because it is a rate over many tokens and the
-    per-token spread is what a user experiences as smoothness.
+    Median for TTFT because a prefill that lands on a cold kernel cache or
+    trips a preemption is several times slower than the same prefill warm, and
+    one such outlier should not become the headline; mean for ITL because it is
+    a rate over many tokens and the per-token spread is what a user experiences
+    as smoothness. Run enough examples for the median to mean something -- at
+    two it is the average of two, which an outlier still dominates.
     """
+    import statistics
+
     ttfts, itls = [], []
     for timeline in data["timelines"]:
         events = timeline["events"]
@@ -341,9 +346,8 @@ def summarise(data: dict) -> dict:
         ttfts.append(events[0][0])
         if len(events) > 1:
             itls.append((events[-1][0] - events[0][0]) / (len(events) - 1))
-    ttfts.sort()
     return {
-        "ttft_ms": ttfts[len(ttfts) // 2] if ttfts else float("nan"),
+        "ttft_ms": statistics.median(ttfts) if ttfts else float("nan"),
         "itl_ms": sum(itls) / len(itls) if itls else float("nan"),
         "tokens": (sum(len(t["events"]) for t in data["timelines"])
                    / max(len(data["timelines"]), 1)),
@@ -586,9 +590,9 @@ def main() -> int:
     parser.add_argument("--no-reorder", dest="reorder", action="store_false",
                         help="serve the documents in their cached order; the "
                              "dense arm then hits its prefix cache")
-    parser.add_argument("--route-layers", default="4",
+    parser.add_argument("--route-layers", default="first",
                         help="LAZY_SPARSE_ROUTE_LAYERS for the route arm: "
-                             "'all', 'first', or a stride")
+                             "'first', 'all', or a stride")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--arm", choices=ARMS, default="",
                         help="measure one arm and write its timeline")

@@ -816,6 +816,88 @@ counters, measured rates and cache-read fraction rather than generated text: at
 600 documents the 1B checkpoint's output is degenerate (§9b — it is incoherent
 past roughly 20 documents), and the timings are real whether or not the text is.
 
+### 2026-08-23 — selection is shared across layers by default, and it is free
+
+`LAZY_SPARSE_ROUTE_LAYERS=first` — route once per step, share the decision with
+every layer below — was gated as an ablation because sharing "is only sound if
+selection transfers across layers, and that is untested". It is now tested, and
+it is now the default. 2wiki, 1B, 200 examples, 10 documents, budget 0.25
+(`sparse_smoke.py --compare`), each arm paired against the same dense run:
+
+| arm | route calls / step | subspan EM | identical to dense | broke | fixed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| dense | — | 57/200 | — | — | — |
+| `all` | 14 | 55/200 | 55/200 | 7 | 5 |
+| stride 4 | 4 | 59/200 | 74/200 | 3 | 5 |
+| **`first`** | **1** | **57/200** | 54/200 | 4 | 4 |
+
+Sharing costs nothing against the per-layer object Phase 0 characterised: same
+identity to dense (54 vs 55), fewer dense-correct answers broken (4 vs 7), EM
+landing exactly on dense. This is consistent with §9b's earlier finding that
+per-layer recall is *flat* — but note it does not follow from it, which is why
+it needed measuring: flat per-layer recall says each layer routes well with its
+**own** query, not that one layer's query routes well for another.
+
+The stride-4 row is the curiosity: it is the most faithful of the three by
+identity (74/200), beating both routing every layer and routing once. Worth an
+explanation eventually — per-layer routing gives each layer a *different* mask,
+so a page dropped at layer L returns at L+1, and the effective mask wanders down
+the stack — but not worth blocking on. `first` is chosen because the router's
+cost is linear in the call count and nothing in the accuracy data argues for
+paying for more calls.
+
+**Why the call count is the only knob.** `router_profile.py --ops` now reports
+the launch budget directly. One route call at 600 documents:
+
+```
+per route call: 477 host ops issuing 221 CUDA kernels
+                2783 us on the host, 785 us on the GPU (3.5x)
+                5.8 us of host time per op
+```
+
+The host is an Intel Core Ultra 5 225F at 3.26 GHz and a trivial Triton launch
+costs 10.8 us here — WSL2's paravirtualised driver is maybe 2x a native host,
+which is a factor of two, not the factor of ten in question. The router is 477
+dispatches because it is elementwise PyTorch over `[1, 5404]` tensors and each
+line is its own kernel; the arithmetic is trivial (the fused Quest scorer does
+all the scoring in 42 us). **Scoring is fused; selection is not** — top-k,
+compaction and the walk-table build are ~470 of the 477 ops. That is the next
+lever, and CUDA-graph capture is the other.
+
+### 2026-08-23 — the speed result depends on corpus size, and 10 documents is the wrong end
+
+With once-per-step routing and the split decode kernel, all three arms
+re-measured (`demo_speedup.py`, each alone on the GPU, 96 forced tokens):
+
+| | dense TTFT | lazy TTFT | dense ms/tok | lazy ms/tok | route ms/tok | kept |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 docs (n=9) | 43 ms | 11 ms | 8.11 | 9.61 | 13.69 | 33.0% |
+| 600 docs (n=2) | 11,327 ms | 129 ms | 9.01 | 10.75 | 9.89 | 25.2% |
+
+**LazyRoute vs Lazy-Attn is +4.08 ms/token at 10 documents and −0.86 ms/token at
+600.** The router's cost is flat in corpus size — 477 dispatches whatever the
+table length — while the attention it removes is proportional to it. Linear
+through the two points puts break-even near **500 documents**. The earlier
+estimate of ~80 was taken before the split kernel; making attention 10x cheaper
+moved break-even out by roughly the same factor, because there is now 10x less
+to save.
+
+Two consequences worth stating plainly. **At 10 documents LazyRoute is a clear
+loss** (0.70x), and 10 documents is where the 1B checkpoint is coherent and
+where all the accuracy work above lives — so the regime that validates selection
+quality and the regime that could show a speedup do not currently overlap on
+this hardware. And **Lazy-Attn's decode is slower than stock vLLM's** at both
+sizes (0.84x, ~1.5 ms/token), so its win is entirely prefill: at 10 documents it
+pays back its decode penalty after ~22 generated tokens and loses on a 96-token
+answer (0.80 s dense vs 1.10 s lazy); at 600 documents it pays back after ~6,400
+and effectively always wins.
+
+Also fixed here: `summarise` took `ttfts[len//2]` after sorting, which for an
+even count is the *upper* of the two middle values, not the median — one cold
+prefill at 600 documents (77 s against a steady-state 11.3 s) became the
+reported TTFT and an inflated 583x headline. It now uses `statistics.median`,
+and the corrected figure at 600 documents is **88x**.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run

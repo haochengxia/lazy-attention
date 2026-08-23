@@ -10,12 +10,17 @@ router in `LazyGPUModelRunner`, once per step for every sequence. That is not
 implementable: the runner's `_prepare_inputs` runs *before* the forward pass, so
 the step's query does not exist yet. The query first exists per layer, after
 q_proj and RoPE, inside the patched `TritonAttentionImpl.forward` -- which is
-also where `benchmarks/lazyroute/d0_e2e.py` measured routing, so running here
-means the engine implements the object Phase 0 characterised. Sharing one
-decision across layers is available as `LAZY_SPARSE_ROUTE_LAYERS=first`, but it
-is an ablation rather than the default: §9b found per-layer recall *flat*, which
-says each layer routes about as well with its own query, not that one layer's
-query routes well for another.
+also where `benchmarks/lazyroute/d0_e2e.py` measured routing.
+
+It runs there **once per step**, not once per layer: the first sparse layer
+routes and every layer below reuses its decision (`LAZY_SPARSE_ROUTE_LAYERS`,
+default `first`). That was an ablation until §9b measured it -- one route call
+per step is *no worse* than fourteen over 200 2wiki examples, matching dense on
+EM and breaking four of its correct answers against the per-layer arm's seven --
+and it is what makes the router affordable at all, since its cost is linear in
+the number of calls and almost none of that cost is arithmetic: one call issues
+477 host operations to submit 785 us of GPU work. Per-layer routing remains
+available as `all` and is the object Phase 0 characterised.
 
 The three invariants the compaction has to respect, all of them properties of
 `kernel_paged_attention_2d_llama`:
@@ -76,7 +81,7 @@ class RouterConfig:
     budget_docs: int = 0
     granularity: str = "page"
     scorer: str = "quest"
-    route_layer_stride: int = 1
+    route_layer_stride: int = 0
     dense_prefix_layers: int = 2
     gqa_agg: str = "max"
     sink_stripe: str = "selected"
