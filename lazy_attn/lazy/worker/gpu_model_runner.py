@@ -204,6 +204,8 @@ class LazyGPUModelRunner(GPUModelRunner):
         # None. Rebuilt every step in `_prepare_inputs`.
         self._desc_fill_targets: Optional[tuple[torch.Tensor,
                                                 torch.Tensor]] = None
+        # Whether any request in the batch is lazy, known on the host.
+        self._any_lazy_reqs = False
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         super().initialize_kv_cache(kv_cache_config)
@@ -309,6 +311,7 @@ class LazyGPUModelRunner(GPUModelRunner):
             if LAZY_SPARSE and req_state.q_offset:
                 self._derive_routing_geometry(idx, req_state.q_offset)
 
+        self._any_lazy_reqs = any_is_lazy
         if LAZY_SPARSE and any_is_lazy:
             self.lazy_doc_id[:num_reqs].copy_(self.lazy_doc_id_cpu[:num_reqs],
                                               non_blocking=True)
@@ -550,10 +553,24 @@ class LazyGPUModelRunner(GPUModelRunner):
                     self.lazy_num_doc_blocks[:num_reqs])
                 metadata.lazy_desc_fill = self._desc_fill_targets
                 metadata.lazy_block_size = self.block_size
+                # How much of the block table is actually populated. The table
+                # is sized for `max_model_len` -- 8192 columns at this model's
+                # 131k context -- while a ten-document request uses about a
+                # hundred, so routing over its full width would score two
+                # orders of magnitude more blocks than exist. The count is
+                # already tracked on the host for the packed-table rebuild, so
+                # reading it costs nothing; taking it off the device would be
+                # a sync per layer per step.
+                counts = self._packed_block_counts[group_idx, :num_reqs]
+                metadata.lazy_max_blocks = int(counts.max()) if num_reqs else 0
                 # A layer routes only when this step is a pure decode step:
                 # prefill sparsification is an explicit non-goal, and the
                 # kernel skips decode rows whose query length exceeds 1.
-                metadata.lazy_sparse_decode = (metadata.max_query_len == 1)
+                # Host-side, so the attention backend can skip routing on a
+                # batch with no lazy requests without reading a device tensor:
+                # that read would be a sync, per layer, per step.
+                metadata.lazy_sparse_decode = (metadata.max_query_len == 1
+                                               and self._any_lazy_reqs)
 
     def _prepare_inputs(
         self,

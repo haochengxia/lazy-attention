@@ -51,6 +51,13 @@ from vllm import SamplingParams  # noqa: E402
 from lazy.entrypoints.llm import LazyLLM  # noqa: E402
 from lazyroute.corpus import load_2wiki, widen  # noqa: E402
 
+# Subspan EM, the repo's own 2wiki metric: normalise away case, punctuation and
+# articles on both sides, then ask whether the gold answer appears anywhere in
+# the generation. Imported rather than reimplemented so this reports the same
+# number `blockbench` does -- a private near-copy is how two arms of the same
+# experiment quietly stop being comparable.
+from blockbench import qa_em_score  # noqa: E402
+
 MODEL = "hxia7/Llama-3.2-1B-block-FT"
 
 
@@ -60,12 +67,24 @@ def main() -> int:
     parser.add_argument("--examples", type=int, default=8)
     parser.add_argument("--docs", type=int, default=10,
                         help="corpus size per example, padded with distractors")
-    parser.add_argument("--max-tokens", type=int, default=32)
+    # These checkpoints restate the question before answering ("What is the
+    # best answer for the question: ..."), so a short budget measures
+    # truncation rather than retrieval: at 32 tokens both dense and sparse
+    # score ~1/8 purely because the answer had not been reached yet.
+    parser.add_argument("--max-tokens", type=int, default=128)
+    # Both arms must batch identically or the comparison is not paired. It is
+    # also a memory bound: the router's scoring tile is sized against the batch
+    # (see `score_tile_blocks`), and on a 16 GB card an unbounded batch of
+    # 10-document requests leaves it nothing to work in.
+    parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--dump", default="",
                         help="write generations here, to diff against a "
                              "dense run with --compare")
     parser.add_argument("--compare", default="",
                         help="a --dump file from a dense run; report identity")
+    parser.add_argument("--verbose", action="store_true",
+                        help="with --compare, print the examples whose "
+                             "correctness flipped, both directions")
     args = parser.parse_args()
 
     pool = load_2wiki(limit=max(args.examples * 4, 40))
@@ -78,7 +97,8 @@ def main() -> int:
                   gpu_memory_utilization=0.85,
                   enable_prefix_caching=True,
                   trust_remote_code=True,
-                  enforce_eager=True)
+                  enforce_eager=True,
+                  max_num_seqs=args.max_num_seqs)
     outputs = llm.generate(
         prompts=[ex.prompt() for ex in examples],
         sampling_params=SamplingParams(temperature=0.0,
@@ -86,11 +106,16 @@ def main() -> int:
         document_seqs=[ex.blocks() for ex in examples])
 
     generations = [out.outputs[0].text.strip() for out in outputs]
-    gold_hits = sum(
-        ex.answer.lower() in gen.lower()
+    hits = sum(
+        qa_em_score(gen, [ex.answer])
         for ex, gen in zip(examples, generations))
-    print(f"EXAMPLES: {len(examples)} docs_per_example={args.docs}")
-    print(f"GOLD_CONTAINMENT: {gold_hits}/{len(examples)}")
+    print(f"EXAMPLES: {len(examples)} docs_per_example={args.docs} "
+          f"max_tokens={args.max_tokens}")
+    print(f"SUBSPAN_EM: {hits:.0f}/{len(examples)} "
+          f"({hits / len(examples):.3f})")
+    truncated = sum(
+        len(out.outputs[0].token_ids) >= args.max_tokens for out in outputs)
+    print(f"HIT_TOKEN_LIMIT: {truncated}/{len(examples)}")
 
     if args.dump:
         with open(args.dump, "w") as handle:
@@ -102,6 +127,30 @@ def main() -> int:
             dense = json.load(handle)
         identical = sum(a == b for a, b in zip(dense, generations))
         print(f"IDENTICAL_TO_DENSE: {identical}/{len(generations)}")
+
+        # Paired outcomes are what carry signal here: comparing two EM *rates*
+        # off a ~0.27 baseline resolves nothing at any sample size we can
+        # afford, but "which examples flipped, and in which direction" is a
+        # McNemar table and is readable at n=40.
+        won, lost = [], []
+        for idx, (ex, before, after) in enumerate(
+                zip(examples, dense, generations)):
+            d_hit = qa_em_score(before, [ex.answer])
+            s_hit = qa_em_score(after, [ex.answer])
+            if d_hit and not s_hit:
+                lost.append(idx)
+            elif s_hit and not d_hit:
+                won.append(idx)
+        print(f"MCNEMAR: dense_only={len(lost)} sparse_only={len(won)} "
+              f"(indices lost={lost} won={won})")
+
+        if args.verbose:
+            for idx in sorted(set(lost) | set(won)):
+                ex = examples[idx]
+                print(f"\n--- example {idx} | gold={ex.answer!r} | "
+                      f"supporting_blocks={ex.supporting_blocks} ---")
+                print(f"  dense : {dense[idx][:220]!r}")
+                print(f"  sparse: {generations[idx][:220]!r}")
 
     sparse = os.environ.get("LAZY_SPARSE", "").strip().lower() in ("1", "true",
                                                                   "yes", "on")

@@ -70,9 +70,16 @@ are allocated, hashed, evicted or packed.
     LAZY_SPARSE_BUDGET_DOCS       int, document budget at GRANULARITY=doc.
                                   Unset (0) means derive it from the token
                                   budget.
-    LAZY_SPARSE_GRANULARITY       page (default) | doc. Page scores are the
-                                  sufficient statistic for both: a document
-                                  scores as the max over its pages.
+    LAZY_SPARSE_GRANULARITY       page (default) | prefix | doc. Page scores
+                                  are the sufficient statistic for all three: a
+                                  document scores as the max over its pages.
+                                  `prefix` keeps every page of a document up to
+                                  the highest one selected, so a late page
+                                  never arrives without its document's head --
+                                  which is where §9b measured 64.5% of the
+                                  cached mass. It subsumes the sink stripe, and
+                                  it spends past the nominal budget, so compare
+                                  it by kept_fraction rather than by budget.
     LAZY_SPARSE_SCORER            quest (default) | oracle | centroid | random.
                                   oracle runs an auxiliary dense pass and is
                                   for evaluation only.
@@ -231,7 +238,7 @@ def lazy_decode_wrapper_profile_enabled() -> bool:
 # Read once at import by the router and the descriptor store; `LAZY_SPARSE`
 # itself gates whether any of the rest is consulted.
 
-SPARSE_GRANULARITIES = ("page", "doc")
+SPARSE_GRANULARITIES = ("page", "prefix", "doc")
 SPARSE_SCORERS = ("quest", "oracle", "centroid", "random")
 SPARSE_SINK_STRIPES = ("selected", "off", "all")
 SPARSE_GQA_AGGS = ("max", "sum")

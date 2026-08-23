@@ -51,10 +51,19 @@ import torch
 from lazy.sparse.descriptors import MAX, MEAN, MIN, DescriptorStore
 from lazy.utils.rotation import MAX_PACKED_Q_OFFSET, PACKED_Q_OFFSET_SHIFT
 
-# Blocks scored in one tile. Bounds the peak of the gather below, which is the
-# router's only allocation that grows with corpus size: without tiling, M=200
-# documents at head_size 128 would materialise ~80 MB per layer per step.
-SCORE_TILE_BLOCKS = 1024
+# Ceiling on the elements materialised by one scoring tile, in fp32. The
+# gather that broadcasts each document's query out to its pages is the router's
+# only allocation that grows with *both* corpus size and batch size, so a tile
+# measured in blocks is the wrong unit: 1024 blocks is 8 MB at batch 1 and
+# 335 MB at batch 40, which on a 16 GB card is the difference between working
+# and thrashing. Tiling on the product keeps the peak flat instead.
+SCORE_TILE_ELEMENTS = 8 << 20  # 32 MB in fp32
+
+
+def score_tile_blocks(num_reqs: int, num_q_heads: int, head_size: int) -> int:
+    """Blocks per scoring tile, so the gather stays near `SCORE_TILE_ELEMENTS`."""
+    per_block = max(num_reqs * num_q_heads * head_size, 1)
+    return max(SCORE_TILE_ELEMENTS // per_block, 1)
 
 # Large enough to dominate any Quest bound, small enough to stay finite so
 # ordering among forced rows is still by score.
@@ -160,12 +169,26 @@ class Router:
         self.config = config
         self.store = store
         self.profile_every = profile_every
-        self._stripe_guard_logged = False
         # Walk-length accounting. The decode kernel reads whole rows, so rows
         # kept over rows dense *is* the bytes/token ratio for the cached part
         # of attention -- the number P2.3 has to report, and the cheapest
         # possible check that routing is actually dropping anything.
-        self.stats = {"calls": 0, "rows_kept": 0, "rows_dense": 0}
+        #
+        # The totals live on the device and are read back only when a log line
+        # is due. Accumulating them into Python ints would sync once per layer
+        # per decode step, which costs more than everything this file does.
+        self.stats = {"calls": 0, "rows_kept": 0, "rows_dense": 0,
+                      "stripe_guard_trips": 0}
+        self._stat_kept: Optional[torch.Tensor] = None
+        self._stat_dense: Optional[torch.Tensor] = None
+        self._stat_guard: Optional[torch.Tensor] = None
+
+    def _ensure_counters(self, device: torch.device) -> None:
+        if self._stat_kept is None:
+            zero = lambda: torch.zeros((), dtype=torch.long, device=device)
+            self._stat_kept, self._stat_dense, self._stat_guard = (zero(),
+                                                                   zero(),
+                                                                   zero())
 
     # -- scoring ------------------------------------------------------------
 
@@ -186,8 +209,10 @@ class Router:
                             device=phys.device,
                             dtype=torch.float32)
 
-        for start in range(0, max_blocks, SCORE_TILE_BLOCKS):
-            stop = min(start + SCORE_TILE_BLOCKS, max_blocks)
+        tile_blocks = score_tile_blocks(num_reqs, q_by_doc.shape[2],
+                                        q_by_doc.shape[3])
+        for start in range(0, max_blocks, tile_blocks):
+            stop = min(start + tile_blocks, max_blocks)
             tile_phys = phys[:, start:stop]
             tile_doc = doc_id[:, start:stop].clamp(min=0).long()
             flat_phys = tile_phys.reshape(-1)
@@ -284,30 +309,63 @@ class Router:
         if stripe is not None:
             # §9b's budget guard: below roughly twice its own cost the stripe
             # destroys more than it saves, which is exactly the large-M regime.
+            # Counted on the device and reported by `_maybe_log`; asking here
+            # whether it tripped would sync once per layer per step.
             affordable = (stripe.sum(1).int() * 2) <= budget
             stripe = stripe & affordable[:, None]
-            if not bool(affordable.all()) and not self._stripe_guard_logged:
-                self._stripe_guard_logged = True
-                from vllm.logger import init_logger
-                init_logger(__name__).warning(
-                    "LAZY_SPARSE_SINK_STRIPE=%s costs more than half the "
-                    "token budget; disabled for those requests. The stripe is "
-                    "worth its budget only above roughly twice its own cost "
-                    "(PROJECT.md §9b).", cfg.sink_stripe)
+            self._stat_guard += (~affordable).sum()
             priority = torch.where(stripe, priority + _FORCED, priority)
 
-        k = int(budget.max().item()) if budget.numel() else 0
+        # Rank every candidate and keep each request's own prefix. A `topk`
+        # would need `k` on the host, and masking its result with a boolean
+        # index is data-dependent -- both sync. Sorting the full width and
+        # scattering a per-request cutoff is the same selection without either.
+        order = priority.argsort(dim=1, descending=True)
+        within = (torch.arange(order.shape[1], device=scores.device)[None, :]
+                  < budget[:, None])
         chosen = torch.zeros_like(candidate)
-        if k > 0:
-            top = priority.topk(k, dim=1).indices
-            rank = torch.arange(k, device=scores.device)
-            within = rank[None, :] < budget[:, None]
-            rows = torch.arange(scores.shape[0],
-                                device=scores.device)[:, None].expand(-1, k)
-            chosen[rows[within], top[within]] = True
-            chosen &= candidate  # topk over an all -inf row picks arbitrarily
+        chosen.scatter_(1, order, within)
+        # A row with fewer candidates than budget would otherwise pick up
+        # whatever the sort put after the -inf entries.
+        chosen &= candidate
+
+        if cfg.granularity == "prefix":
+            chosen = self._close_prefixes(chosen, doc_id, candidate)
 
         return preamble | tail | chosen
+
+    @staticmethod
+    def _close_prefixes(chosen: torch.Tensor, doc_id: torch.Tensor,
+                        candidate: torch.Tensor) -> torch.Tensor:
+        """Extend each document's selection down to its first page.
+
+        If page 3 of a document is worth reading, pages 0-2 come with it. The
+        motivation is §9b's block-head finding: 64.5% of cached attention mass
+        sits on the first two tokens of each document, so a page-level pick that
+        takes a late page and drops the document's head throws that mass away.
+        Prefix closure subsumes the sink stripe -- page 0 is in every non-empty
+        prefix -- which is why `sink_stripe` is redundant here.
+
+        The pages of a document are contiguous and ascending in the block
+        table, so "the prefix" is just "index <= the highest index chosen for
+        this document".
+
+        This *spends more than the nominal budget*: closure is applied after
+        selection, so the budget is a floor rather than a ceiling. Compare arms
+        by the reported `kept_fraction`, not by the budget they were asked for.
+        """
+        width = chosen.shape[1]
+        index = torch.arange(width, device=chosen.device).expand_as(chosen)
+        safe_id = doc_id.clamp(min=0).long()
+
+        highest = torch.full_like(index, -1)
+        highest.scatter_reduce_(1,
+                                safe_id,
+                                torch.where(chosen, index,
+                                            torch.full_like(index, -1)),
+                                reduce="amax",
+                                include_self=True)
+        return candidate & (index <= highest.gather(1, safe_id))
 
     def _select_docs(self, scores: torch.Tensor, doc_id: torch.Tensor,
                      candidate: torch.Tensor,
@@ -323,11 +381,11 @@ class Router:
         `LAZY_SPARSE_BUDGET_DOCS` overrides the derived budget with a document
         count, which is how the offline harness parameterises the same arm.
         """
-        num_reqs = scores.shape[0]
-        num_docs = int(doc_id.max().item()) + 1 if doc_id.numel() else 0
-        if num_docs <= 0:
-            return torch.zeros_like(candidate)
-
+        num_reqs, num_docs = scores.shape
+        # One slot per block rather than per document: a document owns at least
+        # one block, so this is an upper bound, and reading the true count off
+        # the device would sync once per layer per step. The spare slots stay
+        # at -inf and lose every comparison.
         safe_id = doc_id.clamp(min=0).long()
         masked = torch.where(candidate, scores,
                              torch.full_like(scores, float("-inf")))
@@ -384,10 +442,16 @@ class Router:
         which is invariant 1 and 2 in the module docstring, not an incidental
         property of the implementation.
         """
-        order = keep.cumsum(1) - 1
-        rows, cols = keep.nonzero(as_tuple=True)
-        walk = torch.zeros_like(packed)
-        walk[rows, order[rows, cols]] = packed[rows, cols]
+        # Kept rows sort ahead of dropped ones while both keep their original
+        # order, because the sort key is the row index itself, shifted by the
+        # table width for anything dropped. `argsort` rather than `nonzero`
+        # deliberately: `nonzero`'s output size is data-dependent, so it forces
+        # a device-to-host sync -- and this runs once per layer per decode
+        # step, where a sync costs far more than the sort it saves.
+        width = keep.shape[1]
+        index = torch.arange(width, device=keep.device).expand_as(keep)
+        rank = torch.where(keep, index, index + width).argsort(dim=1)
+        walk = packed.gather(1, rank)
 
         kept_doc_rows = (keep & doc_mask).sum(1).int()
         tail_len = seq_lens.int() - num_doc_blocks * block_size
@@ -401,7 +465,8 @@ class Router:
               doc_offsets: torch.Tensor, routable: torch.Tensor,
               query_start_loc: torch.Tensor, cos_sin_cache: torch.Tensor,
               rotary_dim: int, num_kv_heads: int, block_size: int,
-              key_cache: Optional[torch.Tensor] = None) -> WalkTable:
+              key_cache: Optional[torch.Tensor] = None,
+              max_blocks: Optional[int] = None) -> WalkTable:
         """Compact `packed`/`seq_lens` for every routable row; pass others through.
 
         `routable` marks lazy rows taking a single-token decode step. Prefill
@@ -409,48 +474,57 @@ class Router:
         sparsification is an explicit non-goal, and a non-lazy row has no
         document region to route over.
         """
-        walk = packed.clone()
-        out_lens = seq_lens.clone().int()
-        rows = routable.nonzero(as_tuple=True)[0]
-        if rows.numel() == 0:
-            return WalkTable(walk, out_lens)
-
-        sub_packed = packed[rows]
-        phys = (sub_packed >> 32).to(torch.int64)
-        offsets = ((sub_packed >> PACKED_Q_OFFSET_SHIFT)
+        self._ensure_counters(packed.device)
+        # The block table is sized for `max_model_len`, not for what the batch
+        # allocated. Narrowing it to the populated prefix is the single largest
+        # lever in this file: at a 131k context the table is 8192 columns wide
+        # and a ten-document request fills about a hundred of them. The kernel
+        # reads `block_table_stride` off whatever tensor it is handed, so a
+        # narrower table needs no padding back out.
+        if max_blocks is not None:
+            width = max(min(max_blocks, packed.shape[1]), 1)
+            packed = packed[:, :width]
+            doc_id = doc_id[:, :width]
+            doc_offsets = doc_offsets[:, :width]
+        # Every row is scored and then discarded by `torch.where` if it was not
+        # routable, rather than gathered up front. Selecting rows would mean
+        # `nonzero`, whose output size is data-dependent and so syncs -- and
+        # this runs per layer per decode step. A non-routable row is harmless
+        # to score: its geometry says zero document blocks, so nothing is
+        # indexed out of range and its result is thrown away below.
+        phys = (packed >> 32).to(torch.int64)
+        offsets = ((packed >> PACKED_Q_OFFSET_SHIFT)
                    & MAX_PACKED_Q_OFFSET).to(torch.int32)
-        sub_doc_id = doc_id[rows]
-        sub_ndb = num_doc_blocks[rows]
         max_blocks = phys.shape[1]
 
         arange = torch.arange(max_blocks, device=phys.device)
-        num_blocks = torch.div(seq_lens[rows].int() + block_size - 1,
+        num_blocks = torch.div(seq_lens.int() + block_size - 1,
                                block_size,
                                rounding_mode="floor")
         block_valid = arange[None, :] < num_blocks[:, None]
-        doc_mask = (arange[None, :] < sub_ndb[:, None]) & block_valid
+        doc_mask = (arange[None, :] < num_doc_blocks[:, None]) & block_valid
 
-        q = query[query_start_loc[rows].long()]  # [R, H_q, D]
-        q_by_doc = derotate_query(q, doc_offsets[rows], cos_sin_cache,
-                                  rotary_dim)
+        q = query[query_start_loc[:packed.shape[0]].long()]  # [R, H_q, D]
+        q_by_doc = derotate_query(q, doc_offsets, cos_sin_cache, rotary_dim)
 
-        scores = self._score_blocks(layer_name, q_by_doc, phys, sub_doc_id,
+        scores = self._score_blocks(layer_name, q_by_doc, phys, doc_id,
                                     num_kv_heads, key_cache)
         scores = torch.where(doc_mask, scores,
                              torch.full_like(scores, float("-inf")))
 
-        keep = self._select(scores, sub_doc_id, block_valid, doc_mask,
-                            block_size)
-        sub_walk, sub_lens = self.compact(sub_packed, keep, doc_mask,
-                                          seq_lens[rows], sub_ndb, block_size)
-        walk[rows] = sub_walk
-        out_lens[rows] = sub_lens
+        keep = self._select(scores, doc_id, block_valid, doc_mask, block_size)
+        sub_walk, sub_lens = self.compact(packed, keep, doc_mask, seq_lens,
+                                          num_doc_blocks, block_size)
 
-        rows_kept = keep.sum(1).int()
+        walk = torch.where(routable[:, None], sub_walk, packed)
+        out_lens = torch.where(routable, sub_lens, seq_lens.int())
+
+        rows_kept = torch.where(routable, keep.sum(1).int(),
+                                block_valid.sum(1).int())
         rows_dense = block_valid.sum(1).int()
         self.stats["calls"] += 1
-        self.stats["rows_kept"] += int(rows_kept.sum())
-        self.stats["rows_dense"] += int(rows_dense.sum())
+        self._stat_kept += rows_kept.sum()
+        self._stat_dense += rows_dense.sum()
         self._maybe_log()
         return WalkTable(walk, out_lens, rows_kept, rows_dense)
 
@@ -466,6 +540,10 @@ class Router:
             return
         if self.stats["calls"] % self.profile_every:
             return
+        # The only sync in the router, and only every `profile_every` calls.
+        self.stats["rows_kept"] = int(self._stat_kept)
+        self.stats["rows_dense"] = int(self._stat_dense)
+        self.stats["stripe_guard_trips"] = int(self._stat_guard)
         dense = self.stats["rows_dense"]
         # `print`, not `logger`, and deliberately: this runs in the worker
         # process, and the repo's other worker-side probe (`LazyDecodeProfile`)
@@ -474,5 +552,6 @@ class Router:
             f"LazySparseRouter calls={self.stats['calls']} "
             f"rows_kept={self.stats['rows_kept']} rows_dense={dense} "
             f"kept_fraction="
-            f"{(self.stats['rows_kept'] / dense) if dense else float('nan'):.4f}",
+            f"{(self.stats['rows_kept'] / dense) if dense else float('nan'):.4f} "
+            f"stripe_guard_trips={self.stats['stripe_guard_trips']}",
             flush=True)

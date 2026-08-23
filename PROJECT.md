@@ -655,22 +655,80 @@ T2 is the one that matters: it is invariant 6 ("sparse output = exact subset
 attention") checked against the kernel rather than argued, and it fails if a
 rotation, a `q_mask`, or the `seq_lens` arithmetic is off by anything.
 
-**First engine-side numbers (1B, 2wiki, M=10, 8 examples, budget 0.25,
-stripe=selected), via `benchmarks/lazyroute/sparse_smoke.py`:**
+**Two measurement bugs of my own, found before the numbers were believed.**
+First pass reported gold containment 1/8 against dense 1/8 at 32 generated
+tokens. Both were artefacts: these checkpoints restate the question before
+answering, so 32 tokens measured *truncation*, and raw lowercase containment is
+not the repo's metric. Fixed by generating 128 tokens (dense EM then lands at
+0.285, i.e. §9b's ~24–27% ceiling, which is the sanity check that the
+instrument is working) and by importing `blockbench.py::qa_em_score` — subspan
+EM — rather than reimplementing it. `sparse_smoke.py` now also reports
+`HIT_TOKEN_LIMIT`, so truncation cannot masquerade as a routing result again.
 
-- `kept_fraction` **0.311** of cached rows — above the 0.25 budget as expected,
-  since the free preamble and the always-dense tail sit in the denominator.
-- Gold containment **1/8 sparse vs 1/8 dense**; generation identity **2/8**.
-  Both are consistent with §9b and both are noise at this n — recorded as
-  evidence the path runs end to end, *not* as an accuracy result. The standing
-  rule holds: no EM claims at 1B.
+**Two performance bugs, both mine, and the second one dominated everything.**
+The router first ran ~12× slower than dense decode. Host syncs (`.item()`,
+`nonzero`, boolean-mask indexing) inside `_select`/`compact`, once per layer per
+step, were part of it and are gone — selection is now a full sort plus a
+scatter, and the statistics live on the device until a log line is due. But the
+real cost was that **the packed block table is sized for `max_model_len`**:
+8192 columns at this model's 131k context, against roughly a hundred a
+ten-document request actually fills. The router scored the padding. Narrowing
+to the populated prefix — a count the runner already tracks on the host for the
+packed-table rebuild — took 200 examples from >37 minutes to ~70 seconds.
+`tests/sparse` pins that narrowing is invisible to the walk.
+
+**Engine-side results (1B, 2wiki, M=10, 200 examples, 128 tokens, batch 8).**
+Costs are `kept_fraction` — the share of cached rows a decode step reads —
+because the nominal budget is not comparable across granularities.
+
+| arm | kept | subspan EM | identical to dense | dense-only / sparse-only |
+| --- | --- | --- | --- | --- |
+| dense | 1.000 | 57/200 (0.285) | — | — |
+| page 0.25, stripe=selected | 0.352 | 54/200 (0.270) | 62/200 | **7** / 4 |
+| prefix 0.16 | 0.337 | 59/200 (0.295) | 65/200 | **3** / 5 |
+| prefix 0.17 | 0.348 | 62/200 (0.310) | 54/200 | **2** / 7 |
+| doc 0.25 | 0.277 | 55/200 (0.275) | 42/200 | 7 / 5 |
+
+Read the paired McNemar columns, not the rates: at 1B an EM *rate* adjudicates
+nothing (§9b — random selection once "beat" dense by 3.3 points), and prefix
+0.17 scoring above dense is that same artefact, not evidence prefix beats dense.
+What does carry is **how many dense-correct answers a policy breaks**: page
+breaks 7, prefix breaks 2–3 at equal or lower cost, consistently across two
+budgets.
+
+**A new granularity, and the mechanism behind it (`LAZY_SPARSE_GRANULARITY=prefix`).**
+Proposed on the observation that pages of a document are not exchangeable:
+if page b3 is worth reading, b1 and b2 should come with it. The failures page
+selection produces say exactly why. `corpus.py::format_document` writes
+`- Title: {title}` at the head of every block, so **a document's title lives in
+its page 0** — and page-level selection happily keeps a body page while dropping
+the head:
+
+- gold `Tangled Destinies`: dense answers "*Tangled Destinies* is a 1954 3D
+  Technicolor Western directed by William Castle"; sparse answers "*Jesse James
+  vs. the Daltons* is a 1954 3D Technicolor Western directed by William Castle".
+  Correct facts, wrong entity.
+- gold `New York`: dense finds the director and his birthplace; sparse reports
+  the director "is not explicitly mentioned".
+
+Prefix closure prevents this structurally, and subsumes the sink stripe (page 0
+is in every non-empty prefix). It also explains why the stripe did not already
+cover it: `stripe_guard_trips` shows §9b's budget guard disabling the stripe on
+~56% of requests — it withdraws precisely when the budget is tight, which is the
+regime the method targets. Closure spends past the nominal budget, so arms are
+only comparable at matched `kept_fraction`; the rows above are matched.
+
+Not promoting `prefix` to the default on this alone: n=200 with 7-vs-3 flips is
+directional, not decisive. What it deserves is the 8B check and a matched-cost
+sweep, and it should be measured against mass recall and KL, where §9b's gates
+actually live.
 
 Two things this does not yet do. `LAZY_SPARSE_REFRESH` raises unless `every` —
 the cadence is gated on G0-D, which §9b still marks preliminary, so it is not
-worth freezing. And the router is plain torch with a tiled gather: correct and
-bounded in memory, but its host cost is unmeasured against the <5% budget, which
-is what P3.3 exists for. That measurement, and the Phase-1 exit check against
-§9b's offline 0.919 / 0.937, are the next things owed.
+worth freezing. And the router's host cost, though no longer catastrophic, is
+still unmeasured against the <5% budget; that is P3.3's question. That
+measurement, and the Phase-1 exit check against §9b's offline 0.919 / 0.937,
+are the next things owed.
 
 ## 10. Immediate next actions (this week)
 

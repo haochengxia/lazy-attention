@@ -271,6 +271,7 @@ def forward(
                     num_kv_heads=self.num_kv_heads,
                     block_size=attn_metadata.lazy_block_size,
                     key_cache=key_cache,
+                    max_blocks=attn_metadata.lazy_max_blocks,
                 )
                 attn_metadata.lazy_walk_table = walk
             decode_block_table = walk.block_table

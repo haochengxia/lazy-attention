@@ -231,3 +231,109 @@ def test_rows_the_router_was_not_given_are_untouched(layout_factory):
     assert torch.equal(result.block_table[1], packed[1])
     assert int(result.seq_lens[1]) == int(layout.seq_lens[0])
     assert int(result.seq_lens[0]) < int(layout.seq_lens[0])
+
+
+def test_narrowing_the_table_does_not_change_the_walk(layout_factory):
+    """The block table is sized for `max_model_len`, not for what was allocated.
+
+    At a 131k context that is 8192 columns for a request using about a hundred,
+    and scoring the padding is the difference between a router that costs a few
+    percent and one that costs several times the decode step. Narrowing is only
+    safe if it is invisible, which is what this pins: the kernel takes its row
+    stride from the tensor it is handed, so a narrower table must produce the
+    same walk and the same lengths.
+    """
+    layout = layout_factory([64, 48, 80, 96], tail_tokens=20)
+    store, key_cache = _warm_store(layout)
+    query = torch.randn(1, NUM_Q_HEADS, HEAD_SIZE, device="cuda")
+
+    # Pad the table out the way the runner's buffers do, then narrow it back.
+    pad = 8192 - layout.num_blocks
+    wide = dict(
+        packed=torch.nn.functional.pad(layout.packed, (0, pad)),
+        doc_id=torch.nn.functional.pad(layout.doc_id, (0, pad), value=-1),
+        doc_offsets=torch.nn.functional.pad(layout.doc_offsets, (0, pad)),
+    )
+    common = dict(layer_name="layer",
+                  query=query,
+                  cos_sin_cache=rope_table(HEAD_SIZE, 4096),
+                  rotary_dim=HEAD_SIZE,
+                  num_kv_heads=NUM_KV_HEADS,
+                  key_cache=key_cache)
+    router = _router(store, budget_tokens=0.5, sink_stripe="off")
+
+    narrow = router.route(max_blocks=layout.num_blocks,
+                          **common,
+                          **layout.route_kwargs(**wide))
+    full = router.route(max_blocks=None, **common, **layout.route_kwargs(**wide))
+
+    trips = int((narrow.seq_lens[0] + layout.block_size - 1) //
+                layout.block_size)
+    assert torch.equal(narrow.seq_lens, full.seq_lens)
+    assert torch.equal(narrow.block_table[0, :trips],
+                       full.block_table[0, :trips])
+    assert narrow.block_table.shape[1] == layout.num_blocks
+
+
+def test_prefix_granularity_never_takes_a_page_without_its_head(layout_factory):
+    """If page 3 of a document is read, pages 0-2 are read with it.
+
+    The motivation is §9b's block-head result -- 64.5% of cached mass sits on
+    the first two tokens of each document -- so a late page arriving without
+    its document's head is exactly the case worth ruling out. Prefix closure
+    also subsumes the sink stripe, which is why this runs with the stripe off.
+    """
+    layout = layout_factory([64, 48, 80, 96, 32], tail_tokens=20)
+    store, key_cache = _warm_store(layout)
+    query = torch.randn(1, NUM_Q_HEADS, HEAD_SIZE, device="cuda")
+
+    result = _router(store, budget_tokens=0.3, granularity="prefix",
+                     sink_stripe="off").route(
+                         layer_name="layer",
+                         query=query,
+                         cos_sin_cache=rope_table(HEAD_SIZE, 4096),
+                         rotary_dim=HEAD_SIZE,
+                         num_kv_heads=NUM_KV_HEADS,
+                         key_cache=key_cache,
+                         **layout.route_kwargs())
+
+    walked = set(_walk(layout, result))
+    doc_of = layout.doc_id[0].tolist()
+    for doc in range(len(layout.doc_lens)):
+        pages = [
+            int(layout.block_ids[i]) for i, d in enumerate(doc_of) if d == doc
+        ]
+        kept = [p for p in pages if p in walked]
+        if not kept:
+            continue
+        # Whatever was kept must be an unbroken run from the document's head.
+        assert kept == pages[:len(kept)], (
+            f"document {doc} kept {kept} out of {pages} -- not a prefix")
+
+
+def test_prefix_is_a_superset_of_page_at_the_same_budget(layout_factory):
+    """Closure only ever adds pages, and it spends past the nominal budget.
+
+    Recording this because it is the trap in comparing the two arms: `prefix`
+    at budget b reads more than `page` at budget b, so a quality win could be
+    bought with tokens rather than with better selection. Arms have to be
+    compared at matched `kept_fraction`.
+    """
+    layout = layout_factory([64, 48, 80, 96, 32], tail_tokens=20)
+    store, key_cache = _warm_store(layout)
+    query = torch.randn(1, NUM_Q_HEADS, HEAD_SIZE, device="cuda")
+    common = dict(layer_name="layer",
+                  query=query,
+                  cos_sin_cache=rope_table(HEAD_SIZE, 4096),
+                  rotary_dim=HEAD_SIZE,
+                  num_kv_heads=NUM_KV_HEADS,
+                  key_cache=key_cache,
+                  **layout.route_kwargs())
+
+    page = set(_walk(layout, _router(store, budget_tokens=0.3,
+                                     granularity="page",
+                                     sink_stripe="off").route(**common)))
+    prefix = set(_walk(layout, _router(store, budget_tokens=0.3,
+                                       granularity="prefix",
+                                       sink_stripe="off").route(**common)))
+    assert page <= prefix
