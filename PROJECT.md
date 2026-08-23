@@ -597,6 +597,81 @@ Accuracy claims wait for 8B on hardware that fits it — the null here is a
 property of the instrument, and it may well recover at 8B, which is precisely
 why it cannot be assumed either way.
 
+### 2026-08-23 — Phase 1 engine: W1.2–W1.4 and W1.6 landed
+
+`lazy/sparse/{descriptors,router}.py`, behind `LAZY_SPARSE=0`. Suite green at
+**95 passed, 3 skipped** (69 pre-existing, unchanged with the switch unset —
+that is the R1 regression bar). Four departures from §3 as written, each forced
+by the code rather than chosen:
+
+- **W1.3's router cannot live in `LazyGPUModelRunner`.** `_prepare_inputs` runs
+  *before* the forward pass, so the step's query does not exist yet. Routing
+  moved to the patched `TritonAttentionImpl.forward`, where q is in hand — which
+  is also where `d0_e2e.py` measured it, so the engine implements the object
+  Phase 0 characterised. `LAZY_SPARSE_ROUTE_LAYERS={all,first,N}` keeps sharing
+  available as an ablation; `all` is the default, because §9b's flat per-layer
+  recall says each layer routes well *with its own query* and says nothing about
+  whether layer 2's query routes for layer 15.
+- **Page-level ships as the default, doc-level is the arm.** R2 makes page
+  scores sufficient for both, so `LAZY_SPARSE_GRANULARITY={page,doc}` is one
+  scorer and two selection rules. The doc arm takes documents *whole* (greedy by
+  max-over-pages until the budget is spent); letting a token budget cut a
+  document in half would make it neither level and useless as the G0-C
+  comparison.
+- **W1.2's eviction hook is impossible, and unnecessary.** `core/block_pool.py`
+  runs in the EngineCore process; the descriptors are worker GPU tensors, so no
+  call crosses. It is also not needed: a descriptor is a pure function of its
+  block's contents, a document block is only ever written by a document
+  request's prefill, and that path always fills. Freed-and-reused → refilled;
+  prefix-cache hit → contents identical, so the box still holds; never described
+  → `valid` is False and the router scores it `+inf`, i.e. reads it. A lifecycle
+  bug degrades to dense, never to reading one document against another's
+  statistics. The argument is guarded by `LAZY_SPARSE_DESC_VERIFY=1`, which
+  recomputes and compares.
+- **W1.4 needs a signature change after all.** `chunked_prefill_paged_decode`
+  feeds one `seq_lens` to both `context_attention_fwd` and the decode kernel, so
+  a mixed prefill+decode batch cannot share a compacted tensor. Added
+  `decode_block_table` / `decode_seq_lens`, defaulted.
+
+**A convention that was about to become a silent measurement bug.**
+"Always keep doc 0" is only the *preamble* convention when the corpus puts the
+preamble in block 0 — which `benchmarks/lazyroute/corpus.py` does and
+`lazy_block_infer.py` does not. Left implicit, a corpus of the second kind
+reads one real document free *and* shrinks the budget denominator, so its
+numbers would not be comparable to §9b's. Now `LAZY_SPARSE_KEEP_DOC0`, default
+on to match the Phase-0 tables.
+
+**Correctness evidence, in increasing order of what it rules out:**
+
+| check | result |
+| --- | --- |
+| budget=∞ walk table vs packed table | bit-identical, incl. `seq_lens` (T1) |
+| de-rotation vs `llama_v1.py` transcribed elementwise | exact at offsets 1–513 |
+| real Triton kernel over a walk table vs torch attention over exactly those keys | agrees at budgets 1.0 / 0.5 / 0.25 / 0.1 (T2) |
+| `lazy_block_infer.py --mode lazy`, budget=1.0 | reproduces dense output verbatim |
+| `lazy_block_infer.py`, budget 0.34 | still answers the two-hop question correctly |
+
+T2 is the one that matters: it is invariant 6 ("sparse output = exact subset
+attention") checked against the kernel rather than argued, and it fails if a
+rotation, a `q_mask`, or the `seq_lens` arithmetic is off by anything.
+
+**First engine-side numbers (1B, 2wiki, M=10, 8 examples, budget 0.25,
+stripe=selected), via `benchmarks/lazyroute/sparse_smoke.py`:**
+
+- `kept_fraction` **0.311** of cached rows — above the 0.25 budget as expected,
+  since the free preamble and the always-dense tail sit in the denominator.
+- Gold containment **1/8 sparse vs 1/8 dense**; generation identity **2/8**.
+  Both are consistent with §9b and both are noise at this n — recorded as
+  evidence the path runs end to end, *not* as an accuracy result. The standing
+  rule holds: no EM claims at 1B.
+
+Two things this does not yet do. `LAZY_SPARSE_REFRESH` raises unless `every` —
+the cadence is gated on G0-D, which §9b still marks preliminary, so it is not
+worth freezing. And the router is plain torch with a tiled gather: correct and
+bounded in memory, but its host cost is unmeasured against the <5% budget, which
+is what P3.3 exists for. That measurement, and the Phase-1 exit check against
+§9b's offline 0.919 / 0.937, are the next things owed.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run
@@ -611,3 +686,9 @@ why it cannot be assumed either way.
   **Done 2026-08-23 (§9b).**
 5. Send the author email (D0.6): code-drift expectations, 1B Block-FT recipe, benchmark-harness
   reuse. Add a question about the 1B checkpoint's usable document count — §9b puts it near 10.
+6. ~~Land W1.2–W1.4 + W1.6 behind `LAZY_SPARSE`.~~ **Done 2026-08-23 (§9b).** What that
+  leaves owed, in order: the **Phase-1 exit check** (engine mass recall at budget 0.25 on
+  2wiki M=10 against §9b's offline 0.919 / 0.937 — agreement is what says the engine
+  implements the measured object, and a gap is a router bug rather than a new result);
+  the **router overhead breakdown** via `scripts/benchmark/bench_decode_probe.sh` against
+  the <5% budget; then W1.5's oracle arm at scale and the `route_layers=first` ablation.

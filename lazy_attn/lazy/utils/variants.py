@@ -44,6 +44,55 @@ runs. Each becomes a Triton constexpr, so a new value compiles a new kernel:
                                   measured a win only for large-batch decode at
                                   head_size=128 (docs/design.md 4.3)
     LAZY_DECODE_WRAPPER_PROFILE   log decode wrapper timings
+
+Sparse decode (LazyRoute). Off by default; `LAZY_SPARSE=1` turns the whole
+family on and nothing below is read until it is. Sparsity is a *read-time
+view*: these change which cached blocks a decode step walks, never how blocks
+are allocated, hashed, evicted or packed.
+
+    LAZY_SPARSE                   master switch, default off
+    LAZY_SPARSE_BUDGET_TOKENS     float in (0, 1] -- share of the routable
+                                  cached tokens a step may read -- or an
+                                  integer > 1 for an absolute token count.
+                                  Default 0.25. "Routable" excludes the
+                                  preamble and the dense tail, which is the
+                                  denominator the Phase-0 tables use.
+    LAZY_SPARSE_KEEP_DOC0         default on -- document 0 is always read and
+                                  never charged. This is the *preamble
+                                  convention*: `benchmarks/lazyroute/corpus.py`
+                                  submits the system preamble as document 0,
+                                  and the Phase-0 recall tables exclude it from
+                                  both budget and mass. Turn it off for a
+                                  corpus that does not front-load a preamble
+                                  (`lazy_block_infer.py`, for one) -- otherwise
+                                  a real document gets a free pass and the
+                                  budget denominator quietly shrinks.
+    LAZY_SPARSE_BUDGET_DOCS       int, document budget at GRANULARITY=doc.
+                                  Unset (0) means derive it from the token
+                                  budget.
+    LAZY_SPARSE_GRANULARITY       page (default) | doc. Page scores are the
+                                  sufficient statistic for both: a document
+                                  scores as the max over its pages.
+    LAZY_SPARSE_SCORER            quest (default) | oracle | centroid | random.
+                                  oracle runs an auxiliary dense pass and is
+                                  for evaluation only.
+    LAZY_SPARSE_ROUTE_LAYERS      all (default) | first | int N. `all` routes
+                                  per layer with that layer's own query, which
+                                  is what Phase 0 measured. `first` routes once
+                                  and shares the decision, which is only sound
+                                  if selection transfers across layers -- an
+                                  ablation, not a default.
+    LAZY_SPARSE_DENSE_PREFIX_LAYERS  int, default 2. Leading layers left dense
+                                  (Quest convention).
+    LAZY_SPARSE_REFRESH           every (default) | onchange | int N -- how
+                                  often selection is recomputed.
+    LAZY_SPARSE_GQA_AGG           max (default) | sum -- across a GQA group.
+    LAZY_SPARSE_SINK_STRIPE       selected (default) | off | all -- force each
+                                  document's first page into the walk. `all`
+                                  costs page_size/avg_doc_len of the corpus at
+                                  any budget and measured harmful below 50%;
+                                  it is kept only as an ablation arm.
+    LAZY_DESC_DTYPE               bf16 (default) | fp8 -- descriptor storage.
 """
 import os
 
@@ -66,6 +115,43 @@ _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name)
     return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _env_choice(name: str, choices: tuple[str, ...], default: str) -> str:
+    """One of `choices`, or a raised error naming them.
+
+    Unlike the numeric readers below, a misspelled choice is not defaulted
+    away: `LAZY_SPARSE_SCORER=quset` silently running the Quest scorer would
+    produce a plausible number attributed to the wrong policy.
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    value = value.strip().lower()
+    if value not in choices:
+        raise ValueError(f"Unsupported {name}='{value}'. Expected one of: "
+                         f"{', '.join(choices)}.")
+    return value
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(int(value), minimum)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def get_lazy_attention_variant_name() -> str:
@@ -139,3 +225,112 @@ def lazy_decode_compute_cos_sin_enabled() -> bool:
 
 def lazy_decode_wrapper_profile_enabled() -> bool:
     return _env_flag("LAZY_DECODE_WRAPPER_PROFILE")
+
+
+# -- Sparse decode (LazyRoute) ------------------------------------------------
+# Read once at import by the router and the descriptor store; `LAZY_SPARSE`
+# itself gates whether any of the rest is consulted.
+
+SPARSE_GRANULARITIES = ("page", "doc")
+SPARSE_SCORERS = ("quest", "oracle", "centroid", "random")
+SPARSE_SINK_STRIPES = ("selected", "off", "all")
+SPARSE_GQA_AGGS = ("max", "sum")
+DESC_DTYPES = ("bf16", "fp8")
+
+
+def lazy_sparse_enabled() -> bool:
+    return _env_flag("LAZY_SPARSE")
+
+
+def lazy_sparse_budget_tokens() -> float:
+    """Share of routable cached tokens if <= 1, else an absolute token count.
+
+    Routable excludes the preamble and the dense tail, matching the denominator
+    the Phase-0 recall tables use -- an engine number computed against a
+    different denominator cannot be compared to them.
+    """
+    return _env_float("LAZY_SPARSE_BUDGET_TOKENS", 0.25)
+
+
+def lazy_sparse_keep_doc0() -> bool:
+    """Whether document 0 is read free of charge (the preamble convention)."""
+    value = os.environ.get("LAZY_SPARSE_KEEP_DOC0")
+    if value is None or not value.strip():
+        return True
+    return value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def lazy_sparse_budget_docs() -> int:
+    """0 means derive the document budget from the token budget."""
+    return _env_int("LAZY_SPARSE_BUDGET_DOCS", 0)
+
+
+def lazy_sparse_granularity() -> str:
+    return _env_choice("LAZY_SPARSE_GRANULARITY", SPARSE_GRANULARITIES, "page")
+
+
+def lazy_sparse_scorer() -> str:
+    return _env_choice("LAZY_SPARSE_SCORER", SPARSE_SCORERS, "quest")
+
+
+def lazy_sparse_route_layer_stride() -> int:
+    """How often to recompute selection down the layer stack.
+
+    1 (`all`, the default) routes in every sparse layer with that layer's own
+    query -- the object Phase 0 measured. 0 (`first`) routes once and shares
+    the decision with every later layer, which is only sound if selection
+    transfers across layers; that is untested, so it is an ablation arm rather
+    than a default. N routes every N layers.
+    """
+    value = os.environ.get("LAZY_SPARSE_ROUTE_LAYERS")
+    if value is None or not value.strip():
+        return 1
+    value = value.strip().lower()
+    if value == "all":
+        return 1
+    if value == "first":
+        return 0
+    try:
+        return max(int(value), 1)
+    except ValueError:
+        raise ValueError(
+            f"Unsupported LAZY_SPARSE_ROUTE_LAYERS='{value}'. Expected "
+            f"'all', 'first', or a positive integer stride.") from None
+
+
+def lazy_sparse_dense_prefix_layers() -> int:
+    """Leading layers left dense, Quest convention."""
+    return _env_int("LAZY_SPARSE_DENSE_PREFIX_LAYERS", 2)
+
+
+def lazy_sparse_refresh() -> tuple[str, int]:
+    """('every', 1) | ('onchange', 1) | ('interval', N).
+
+    `onchange` still scores every step; what it skips is rebuilding the walk
+    table when the selected set did not move.
+    """
+    value = os.environ.get("LAZY_SPARSE_REFRESH")
+    if value is None or not value.strip():
+        return ("every", 1)
+    value = value.strip().lower()
+    if value in ("every", "onchange"):
+        return (value, 1)
+    try:
+        return ("interval", max(int(value), 1))
+    except ValueError:
+        raise ValueError(
+            f"Unsupported LAZY_SPARSE_REFRESH='{value}'. Expected 'every', "
+            f"'onchange', or a positive integer.") from None
+
+
+def lazy_sparse_gqa_agg() -> str:
+    return _env_choice("LAZY_SPARSE_GQA_AGG", SPARSE_GQA_AGGS, "max")
+
+
+def lazy_sparse_sink_stripe() -> str:
+    return _env_choice("LAZY_SPARSE_SINK_STRIPE", SPARSE_SINK_STRIPES,
+                       "selected")
+
+
+def lazy_desc_dtype() -> str:
+    return _env_choice("LAZY_DESC_DTYPE", DESC_DTYPES, "bf16")

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer with PagedAttention and Triton prefix prefill."""
+import os
 import time
 from typing import Any, Optional
 
@@ -13,9 +14,23 @@ from .flash_attn import FlashAttentionMetadata
 from ..ops.chunked_prefill_paged_decode import chunked_prefill_paged_decode
 from ..old_ops.chunked_prefill_paged_decode import (
     chunked_prefill_paged_decode as chunked_prefill_paged_decode_old)
+from lazy.sparse.descriptors import DescriptorStore
+from lazy.sparse.router import Router, RouterConfig
 from lazy.utils.variants import (
     is_mepic_variant,
+    lazy_desc_dtype,
     lazy_profile_attn_backend_enabled,
+    lazy_sparse_budget_docs,
+    lazy_sparse_budget_tokens,
+    lazy_sparse_dense_prefix_layers,
+    lazy_sparse_enabled,
+    lazy_sparse_gqa_agg,
+    lazy_sparse_granularity,
+    lazy_sparse_keep_doc0,
+    lazy_sparse_refresh,
+    lazy_sparse_route_layer_stride,
+    lazy_sparse_scorer,
+    lazy_sparse_sink_stripe,
     mepic_force_fp32_rotary_enabled,
 )
 
@@ -23,6 +38,71 @@ from lazy.utils.variants import (
 USE_OLD_MEPIC_KERNEL = is_mepic_variant()
 MEPIC_FORCE_FP32_ROTARY = mepic_force_fp32_rotary_enabled()
 PROFILE_ATTN_BACKEND = lazy_profile_attn_backend_enabled()
+LAZY_SPARSE = lazy_sparse_enabled()
+
+_ROUTER: Optional[Router] = None
+# Layer ordinals in call order, so `LAZY_SPARSE_ROUTE_LAYERS` and the dense
+# prefix can be expressed without the layer objects knowing their own depth.
+_LAYER_ORDINAL: dict[str, int] = {}
+
+
+def get_router() -> Router:
+    """The worker's single router, built on first use.
+
+    Constructed lazily rather than at import so that a process which never
+    decodes -- a CPU-only test collecting this module, say -- pays nothing, and
+    so that a bad switch value raises where it can be attributed.
+    """
+    global _ROUTER
+    if _ROUTER is None:
+        mode, _ = lazy_sparse_refresh()
+        if mode != "every":
+            raise NotImplementedError(
+                f"LAZY_SPARSE_REFRESH={mode} is not wired yet: selection is "
+                "recomputed every step. Refresh policy is gated on G0-D, which "
+                "PROJECT.md §9b still records as preliminary (short forced "
+                "answers), so the cadence is not yet worth freezing.")
+        scorer = lazy_sparse_scorer()
+        _ROUTER = Router(
+            RouterConfig(
+                budget_tokens=lazy_sparse_budget_tokens(),
+                budget_docs=lazy_sparse_budget_docs(),
+                granularity=lazy_sparse_granularity(),
+                scorer=scorer,
+                route_layer_stride=lazy_sparse_route_layer_stride(),
+                dense_prefix_layers=lazy_sparse_dense_prefix_layers(),
+                gqa_agg=lazy_sparse_gqa_agg(),
+                sink_stripe=lazy_sparse_sink_stripe(),
+                keep_doc0=lazy_sparse_keep_doc0(),
+            ),
+            DescriptorStore(
+                dtype=lazy_desc_dtype(),
+                verify=os.environ.get("LAZY_SPARSE_DESC_VERIFY",
+                                      "").strip().lower()
+                in ("1", "true", "yes", "on"),
+                with_mean=scorer == "centroid",
+            ),
+            profile_every=_env_int("LAZY_SPARSE_PROFILE", 0),
+        )
+    return _ROUTER
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    if value.lower() in ("1", "true", "yes", "on"):
+        return 100
+    try:
+        return max(int(value), 0)
+    except ValueError:
+        return default
+
+
+def _layer_ordinal(layer_name: str) -> int:
+    if layer_name not in _LAYER_ORDINAL:
+        _LAYER_ORDINAL[layer_name] = len(_LAYER_ORDINAL)
+    return _LAYER_ORDINAL[layer_name]
 
 _ATTN_PROFILE_STATE = {
     "calls": 0,
@@ -114,6 +194,20 @@ def forward(
             write_cache_ms)
     else:
         write_cache_ms = 0.0
+
+    lazy_layer_name = getattr(layer, "layer_name", "") or "<unknown>"
+    if LAZY_SPARSE and not USE_OLD_MEPIC_KERNEL:
+        # Describe whatever document blocks this step just completed. This is
+        # the one moment those keys are in the cache and known to belong to a
+        # single document, which is what makes the descriptor reusable across
+        # every later request that hits the same blocks.
+        desc_fill = getattr(attn_metadata, "lazy_desc_fill", None)
+        if desc_fill is not None:
+            fill_blocks, fill_lens = desc_fill
+            store = get_router().store
+            store.fill(lazy_layer_name, key_cache, fill_blocks, fill_lens)
+            store.check(lazy_layer_name, key_cache, fill_blocks, fill_lens)
+
     is_lazy = None
     lazy_variant = None
     q_offset = None
@@ -140,8 +234,50 @@ def forward(
         lazy_variant = attn_metadata.lazy_variant
         q_offset = attn_metadata.q_offset
         q_mask = attn_metadata.q_mask
+    # Route, if this is a sparse decode step. The walk table replaces the
+    # packed block table for the decode launch only; prefill rows, non-lazy
+    # rows and the prefill path itself keep the dense tensors.
+    decode_block_table = None
+    decode_seq_lens = None
+    if (LAZY_SPARSE and not USE_OLD_MEPIC_KERNEL
+            and getattr(attn_metadata, "lazy_sparse_decode", False)
+            and packed_block_table is not None and cos_sin_cache is not None
+            and rotary_dim is not None):
+        router = get_router()
+        ordinal = _layer_ordinal(lazy_layer_name)
+        if ordinal >= router.config.dense_prefix_layers:
+            stride = router.config.route_layer_stride
+            cached = getattr(attn_metadata, "lazy_walk_table", None)
+            # stride 0 ("first") routes once and shares; stride N routes every
+            # Nth layer and shares in between. Both cache on the step's
+            # metadata object, which every layer in the KV group already shares
+            # and which is rebuilt each step -- so nothing here outlives a step.
+            if cached is not None and (stride == 0 or ordinal % stride):
+                walk = cached
+            else:
+                routable = is_lazy & (attn_metadata.lazy_num_doc_blocks > 0)
+                walk = router.route(
+                    layer_name=lazy_layer_name,
+                    query=query,
+                    packed=packed_block_table,
+                    seq_lens=sequesd_k,
+                    doc_id=attn_metadata.lazy_doc_id,
+                    num_doc_blocks=attn_metadata.lazy_num_doc_blocks,
+                    doc_offsets=attn_metadata.lazy_doc_offset,
+                    routable=routable,
+                    query_start_loc=cu_seqlens_q,
+                    cos_sin_cache=cos_sin_cache,
+                    rotary_dim=rotary_dim,
+                    num_kv_heads=self.num_kv_heads,
+                    block_size=attn_metadata.lazy_block_size,
+                    key_cache=key_cache,
+                )
+                attn_metadata.lazy_walk_table = walk
+            decode_block_table = walk.block_table
+            decode_seq_lens = walk.seq_lens
+
     # Compute attention and update output up to `num_actual_tokens`.
-    
+
     # NOTE(haocheng): we give query a extra budget
     kernel_kwargs = dict(
         query=query[:num_actual_tokens+1],
@@ -183,6 +319,8 @@ def forward(
             q_offset=q_offset,
             q_mask=q_mask,
             packed_block_table=packed_block_table,
+            decode_block_table=decode_block_table,
+            decode_seq_lens=decode_seq_lens,
         )
         chunked_prefill_paged_decode(**kernel_kwargs)
     if PROFILE_ATTN_BACKEND:
@@ -314,3 +452,19 @@ def apply_patch():
 def revert_patch():
     import vllm.v1.attention.backends.triton_attn
     vllm.v1.attention.backends.triton_attn.TritonAttentionImpl.forward = original_forward
+
+
+def get_sparse_router_stats() -> dict[str, float]:
+    """Walk-length accounting for the sparse decoder, or empty if it never ran.
+
+    `rows_kept / rows_dense` is the share of cached blocks a decode step
+    actually reads. It is deliberately not a bytes/token figure for the whole
+    step: §9b measured ~25% of decode attention landing outside the cache
+    (query plus generated tail), which the router always keeps dense.
+    """
+    if _ROUTER is None:
+        return {}
+    stats = dict(_ROUTER.stats)
+    if stats["rows_dense"]:
+        stats["kept_fraction"] = stats["rows_kept"] / stats["rows_dense"]
+    return stats

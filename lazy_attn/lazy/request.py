@@ -49,6 +49,7 @@ class LazyRequest:
         document_lens_padded: Optional[list[int]] = None,
         document_seq_hash: Optional[str] = None,
         is_document_request: bool = False,
+        document_true_len: Optional[int] = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -119,6 +120,12 @@ class LazyRequest:
         self.arrival_time = arrival_time
         # Get extra attributes for LazyAttention
         self.is_document_request = is_document_request
+        # A document request prefills the *padded* document, so its prompt
+        # length says nothing about how many of those keys are real. The sparse
+        # router's descriptors have to exclude the padding rows (they hold
+        # genuine `<pad>` keys that would widen the box), so the true length
+        # travels with the request that writes them.
+        self.document_true_len = document_true_len
         self.documents_token_ids_padded = documents_token_ids_padded
         self.document_lens = document_lens
         self.document_lens_padded = document_lens_padded
@@ -235,6 +242,7 @@ class LazyRequest:
             arrival_time=self.arrival_time,
             cache_salt=self.cache_salt,
             is_document_request=True,
+            document_true_len=self.document_lens[doc_idx],
         )
 
     @property

@@ -62,6 +62,12 @@ def chunked_prefill_paged_decode(
     q_offset=None,
     q_mask=None,
     packed_block_table=None,
+    # Sparse decode: the walk table and its matching lengths. The plan hoped to
+    # reuse `block_table`/`seq_lens`, but they are shared with
+    # `context_attention_fwd` above, so a mixed prefill+decode batch cannot
+    # carry one compacted pair -- the decode side needs its own.
+    decode_block_table=None,
+    decode_seq_lens=None,
 ):
     if no_lazy_enabled():
         is_lazy.fill_(False)
@@ -162,9 +168,14 @@ def chunked_prefill_paged_decode(
         decode_kernel = (kernel_paged_attention_2d_llama_lazy_only
                          if force_split_decode and all_lazy
                          else kernel_paged_attention_2d_llama)
-        decode_block_table = (
-            packed_block_table if packed_block_table is not None else block_table
-        )
+        # A sparse walk table already carries packed entries, so it supersedes
+        # the packed table; without one the dense packed table is used, and
+        # without that the plain block table.
+        if decode_block_table is None:
+            decode_block_table = (packed_block_table
+                                  if packed_block_table is not None else
+                                  block_table)
+        decode_lens = decode_seq_lens if decode_seq_lens is not None else seq_lens
         if profile_decode:
             total_start.record()
             kernel_start.record()
@@ -177,7 +188,7 @@ def chunked_prefill_paged_decode(
                 key_cache_ptr=key_cache,
                 value_cache_ptr=value_cache,
                 block_tables_ptr=decode_block_table,
-                seq_lens_ptr=seq_lens,
+                seq_lens_ptr=decode_lens,
                 alibi_slopes_ptr=alibi_slopes,
                 scale=sm_scale,
                 k_scale=k_scale,

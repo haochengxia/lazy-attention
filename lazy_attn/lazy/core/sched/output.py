@@ -26,6 +26,13 @@ class NewRequestData(BaseNewRequestData):
     q_offset: Optional[list[int]] = None  # [num_seqs, num_blocks]
     q_mask: Optional[list[int]] = None  # [num_seqs, num_blocks]
 
+    # A document request is the one that *writes* a document's KV blocks, so it
+    # is where the sparse router's descriptors are built. `document_true_len`
+    # is the unpadded length; the prompt itself is padded to whole blocks, and
+    # the padding rows hold real `<pad>` keys that must stay out of the box.
+    is_document_request: bool = False
+    document_true_len: Optional[int] = None
+
     @classmethod
     def from_request(
         cls,
@@ -43,4 +50,6 @@ class NewRequestData(BaseNewRequestData):
             lazy_variant=lazy_variant,
             q_offset=q_offset,
             q_mask=q_mask,
+            is_document_request=request.is_document_request,
+            document_true_len=request.document_true_len,
         )

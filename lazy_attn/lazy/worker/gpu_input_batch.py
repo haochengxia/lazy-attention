@@ -45,6 +45,12 @@ class CachedRequestState:
     q_offset: Optional[list[int]] = None
     q_mask: Optional[list[int]] = None
 
+    # Set for the requests that populate a document's KV blocks. The sparse
+    # router's descriptors are built as those blocks fill, and `true_len`
+    # is what keeps the padding rows out of the box.
+    is_document_request: bool = False
+    document_true_len: Optional[int] = None
+
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[int] = None
 

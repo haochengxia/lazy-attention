@@ -468,6 +468,51 @@ Inside `chunked_prefill_paged_decode`:
 Because `is_lazy` is per request, lazy and ordinary requests coexist in one batch:
 non-lazy rows take the untouched path through the same kernel.
 
+### 5.1 Sparse decode as a read-time view (`LAZY_SPARSE`)
+
+Off by default. When on, a decode step reads only the cached pages worth
+reading, and it does so **without changing any state**: allocation, hashing,
+eviction, preemption and the persistent packed block table are untouched. Each
+step gathers a subset of that table's rows into a *walk table* and hands the
+kernel that instead. The kernel itself is not modified.
+
+Two tensors carry it, both in [`lazy/sparse/`](../lazy_attn/lazy/sparse/):
+
+* **Descriptors** — a min/max box per (layer, physical block, KV head), built as
+  a document request's blocks fill and keyed by physical block id, so a
+  prefix-cache hit inherits the box the first writer computed. Two vectors per
+  16-token page is 12.5% of K bytes, 6.25% of KV. A document's padding rows are
+  excluded: they hold genuine `<pad>` keys, and the kernel already masks them
+  via `q_mask`.
+* **The walk table** — the packed table with rows dropped. Scoring happens in
+  `TritonAttentionImpl.forward`, where the query exists; the query is de-rotated
+  per document by the same arithmetic the kernel uses, then bounded against each
+  box.
+
+Three properties of the kernel constrain the compaction, and all three are
+tested in [`tests/sparse/`](../lazy_attn/tests/sparse/):
+
+1. **Rows keep their original ascending order.** The kernel re-rotates Q only
+   when `rot_offset` changes between adjacent rows, so keeping a document's
+   pages together preserves that elision. Score order would re-rotate almost
+   every row.
+2. **The tail run is preserved.** Tail continuation blocks carry `q_offset == 0`,
+   which the kernel reads as "keep the previous rotation" — correct only after
+   the `q_offset == 1` query block. Every document row ahead of them carries an
+   explicit nonzero offset, so dropping documents cannot disturb this.
+3. **`seq_lens` becomes the walk length**, `kept_doc_rows * block_size +
+   tail_len`, because the kernel derives its trip count as
+   `cdiv(seq_len, BLOCK_SIZE)` and masks the last row with the same value.
+
+The decode launch therefore needs its own `(table, lengths)` pair:
+`chunked_prefill_paged_decode` shares `seq_lens` with `context_attention_fwd`,
+so a mixed prefill+decode batch cannot carry one compacted tensor. Hence the
+`decode_block_table` / `decode_seq_lens` arguments, which default to today's
+behaviour when absent.
+
+Budget = ∞ reproduces the dense table bit for bit, which is the anchor the rest
+of the correctness argument hangs from.
+
 ## 6. Variants
 
 `LAZY_ATTENTION_VARIANT` picks the kernel set, the RoPE behaviour and the

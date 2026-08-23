@@ -64,13 +64,16 @@ from lazy.worker.gpu_input_batch import CachedRequestState
 from lazy.attention.backends.flash_attn import FlashAttentionMetadata
 from lazy.utils.rotation import (MAX_PACKED_BLOCK_SIZE, MAX_PACKED_Q_MASK,
                                  MAX_PACKED_Q_OFFSET, PACKED_Q_OFFSET_SHIFT)
+from lazy.sparse.descriptors import newly_complete_blocks
 from lazy.utils.variants import (lazy_shared_kv_profile_enabled,
                                  lazy_shared_kv_profile_min_reqs,
-                                 lazy_packed_block_profile_enabled)
+                                 lazy_packed_block_profile_enabled,
+                                 lazy_sparse_enabled)
 
 LAZY_SHARED_KV_PROFILE = lazy_shared_kv_profile_enabled()
 LAZY_SHARED_KV_PROFILE_MIN_REQS = lazy_shared_kv_profile_min_reqs()
 LAZY_PACKED_BLOCK_PROFILE = lazy_packed_block_profile_enabled()
+LAZY_SPARSE = lazy_sparse_enabled()
 
 class LazyGPUModelRunner(GPUModelRunner):
 
@@ -153,6 +156,55 @@ class LazyGPUModelRunner(GPUModelRunner):
         # attention-backend reordering without relying on vLLM internals.
         self._last_req_ids: tuple = ()
 
+        # Routing geometry for the sparse decoder. All of it is static for a
+        # request's lifetime -- which document each block belongs to, where the
+        # document region ends and the dense tail begins -- so it is derived
+        # once when the batch composition changes, not once per step.
+        #
+        # `lazy_doc_id` is -1 on tail rows. The split between documents and
+        # tail cannot be read off q_offset: a corpus whose documents are all
+        # block-aligned gives document 0 an offset of 1, which is also the
+        # query block's marker, so the block *count* is what separates them.
+        self.lazy_doc_id = torch.full((self.max_num_reqs,
+                                       self.max_num_blocks_per_req),
+                                      -1,
+                                      dtype=torch.int32,
+                                      device=self.device)
+        self.lazy_doc_id_cpu = torch.full((self.max_num_reqs,
+                                           self.max_num_blocks_per_req),
+                                          -1,
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
+        self.lazy_doc_id_np = self.lazy_doc_id_cpu.numpy()
+
+        # q_offset of each document, indexed by document rather than by block:
+        # the router de-rotates one query per document, not one per page.
+        self.lazy_doc_offset = torch.zeros((self.max_num_reqs,
+                                            self.max_num_blocks_per_req),
+                                           dtype=torch.int32,
+                                           device=self.device)
+        self.lazy_doc_offset_cpu = torch.zeros((self.max_num_reqs,
+                                                self.max_num_blocks_per_req),
+                                               dtype=torch.int32,
+                                               device="cpu",
+                                               pin_memory=self.pin_memory)
+        self.lazy_doc_offset_np = self.lazy_doc_offset_cpu.numpy()
+
+        self.lazy_num_doc_blocks = torch.zeros((self.max_num_reqs, ),
+                                               dtype=torch.int32,
+                                               device=self.device)
+        self.lazy_num_doc_blocks_cpu = torch.zeros((self.max_num_reqs, ),
+                                                   dtype=torch.int32,
+                                                   device="cpu",
+                                                   pin_memory=self.pin_memory)
+        self.lazy_num_doc_blocks_np = self.lazy_num_doc_blocks_cpu.numpy()
+
+        # (block_ids, valid_lens) for the descriptors this step can build, or
+        # None. Rebuilt every step in `_prepare_inputs`.
+        self._desc_fill_targets: Optional[tuple[torch.Tensor,
+                                                torch.Tensor]] = None
+
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         super().initialize_kv_cache(kv_cache_config)
 
@@ -209,6 +261,10 @@ class LazyGPUModelRunner(GPUModelRunner):
         self.lazy_variant_cpu[:num_reqs].fill_(0)
         self.lazy_offset_cpu[:num_reqs].fill_(0)
         self.lazy_mask_cpu[:num_reqs].fill_(0)
+        if LAZY_SPARSE:
+            self.lazy_doc_id_cpu[:num_reqs].fill_(-1)
+            self.lazy_doc_offset_cpu[:num_reqs].fill_(0)
+            self.lazy_num_doc_blocks_cpu[:num_reqs].fill_(0)
 
         any_is_lazy = False
         for idx, req_id in enumerate(req_ids):
@@ -250,6 +306,16 @@ class LazyGPUModelRunner(GPUModelRunner):
                         f"q_mask field holds. Packing it would corrupt the "
                         f"rotation offset and answer the request wrongly.")
                 self.lazy_mask_np[idx, :len(req_state.q_mask)] = req_state.q_mask
+            if LAZY_SPARSE and req_state.q_offset:
+                self._derive_routing_geometry(idx, req_state.q_offset)
+
+        if LAZY_SPARSE and any_is_lazy:
+            self.lazy_doc_id[:num_reqs].copy_(self.lazy_doc_id_cpu[:num_reqs],
+                                              non_blocking=True)
+            self.lazy_doc_offset[:num_reqs].copy_(
+                self.lazy_doc_offset_cpu[:num_reqs], non_blocking=True)
+            self.lazy_num_doc_blocks[:num_reqs].copy_(
+                self.lazy_num_doc_blocks_cpu[:num_reqs], non_blocking=True)
 
         self.is_lazy_req[:num_reqs].copy_(self.is_lazy_req_cpu[:num_reqs],
                                           non_blocking=True)
@@ -260,6 +326,70 @@ class LazyGPUModelRunner(GPUModelRunner):
                                               non_blocking=True)
             self.lazy_mask[:num_reqs].copy_(self.lazy_mask_cpu[:num_reqs],
                                             non_blocking=True)
+
+    def _derive_routing_geometry(self, idx: int, q_offset: list[int]) -> None:
+        """Which document each cached block belongs to, for one request row.
+
+        `metadata_for_lazy_attention` emits one entry per document block plus
+        one for the query block, so the document region is everything but the
+        last entry. Inside it, q_offset is constant within a document and
+        strictly increasing across documents (it accumulates true document
+        lengths), so a document boundary is exactly a change in q_offset.
+
+        Both facts are static for the request's lifetime, which is why this runs
+        on batch composition changes rather than per step.
+        """
+        num_doc_blocks = len(q_offset) - 1
+        self.lazy_num_doc_blocks_np[idx] = num_doc_blocks
+        if num_doc_blocks <= 0:
+            return
+        offsets = np.asarray(q_offset[:num_doc_blocks], dtype=np.int32)
+        starts = np.empty(num_doc_blocks, dtype=bool)
+        starts[0] = True
+        np.not_equal(offsets[1:], offsets[:-1], out=starts[1:])
+        doc_ids = np.cumsum(starts) - 1
+        self.lazy_doc_id_np[idx, :num_doc_blocks] = doc_ids
+        self.lazy_doc_offset_np[idx, :starts.sum()] = offsets[starts]
+
+    def _document_fill_targets(
+            self, scheduler_output: "SchedulerOutput"
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Blocks whose descriptors this step can build, and their live rows.
+
+        A document request writes the blocks that later requests route over, so
+        its prefill is the one moment those keys are in the cache and known to
+        belong to one document. Chunked prefill can stop mid-block, so only
+        blocks this step *completes* are described; the chunk that finishes a
+        partial block picks it up.
+        """
+        block_ids: list[int] = []
+        valid_lens: list[int] = []
+        for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
+            req_state = self.requests.get(req_id)
+            if req_state is None or not req_state.is_document_request:
+                continue
+            row = self.input_batch.req_id_to_index.get(req_id)
+            if row is None:
+                continue
+            computed = int(self.input_batch.num_computed_tokens_cpu[row])
+            start, stop = newly_complete_blocks(computed, num_scheduled,
+                                                self.block_size)
+            if stop <= start:
+                continue
+            table = self.input_batch.block_table[0].block_table_np[row]
+            num_prompt = req_state.num_prompt_tokens
+            true_len = req_state.document_true_len or num_prompt
+            last_block = num_prompt // self.block_size - 1
+            for blk in range(start, stop):
+                block_ids.append(int(table[blk]))
+                valid_lens.append(self.block_size if blk != last_block else
+                                  self.block_size - (num_prompt - true_len))
+        if not block_ids:
+            return None
+        return (torch.tensor(block_ids, dtype=torch.int64,
+                             device=self.device),
+                torch.tensor(valid_lens, dtype=torch.int32,
+                             device=self.device))
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update cached states, then attach the lazy per-request metadata.
@@ -286,6 +416,11 @@ class LazyGPUModelRunner(GPUModelRunner):
             req_state.lazy_variant = getattr(new_req_data, "lazy_variant", 0)
             req_state.q_offset = getattr(new_req_data, "q_offset", None)
             req_state.q_mask = getattr(new_req_data, "q_mask", None)
+            req_state.is_document_request = getattr(new_req_data,
+                                                    "is_document_request",
+                                                    False)
+            req_state.document_true_len = getattr(new_req_data,
+                                                  "document_true_len", None)
 
         # A different req_id ordering covers additions, removals and
         # attention-backend reordering, without depending on base-class
@@ -404,6 +539,21 @@ class LazyGPUModelRunner(GPUModelRunner):
             group_idx = self._layer_to_kv_group.get(layer_name, 0)
             metadata.packed_block_table = (
                 self.packed_block_tables[group_idx][:num_reqs])
+            if LAZY_SPARSE:
+                # Routing geometry (static per request) and this step's
+                # descriptor work. The router itself runs in the attention
+                # backend, where the query exists; everything it needs that the
+                # runner knows travels here.
+                metadata.lazy_doc_id = self.lazy_doc_id[:num_reqs]
+                metadata.lazy_doc_offset = self.lazy_doc_offset[:num_reqs]
+                metadata.lazy_num_doc_blocks = (
+                    self.lazy_num_doc_blocks[:num_reqs])
+                metadata.lazy_desc_fill = self._desc_fill_targets
+                metadata.lazy_block_size = self.block_size
+                # A layer routes only when this step is a pure decode step:
+                # prefill sparsification is an explicit non-goal, and the
+                # kernel skips decode rows whose query length exceeds 1.
+                metadata.lazy_sparse_decode = (metadata.max_query_len == 1)
 
     def _prepare_inputs(
         self,
@@ -422,6 +572,10 @@ class LazyGPUModelRunner(GPUModelRunner):
 
         num_reqs = self.input_batch.num_reqs
         self._rebuild_packed_block_table(num_reqs)
+        # Computed before the metadata is attached and after the base class has
+        # advanced the block tables, so the block ids it reads are this step's.
+        self._desc_fill_targets = (self._document_fill_targets(scheduler_output)
+                                   if LAZY_SPARSE else None)
         self._attach_lazy_attn_metadata(attn_metadata, num_reqs)
 
         if LAZY_SHARED_KV_PROFILE and num_reqs >= LAZY_SHARED_KV_PROFILE_MIN_REQS:
