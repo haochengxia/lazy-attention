@@ -127,6 +127,20 @@ def _build_llm(arm: str, args):
                   trust_remote_code=True,
                   enforce_eager=not args.cuda_graphs,
                   max_num_seqs=args.batch)
+    # An 8B checkpoint is 15 GB of bf16 weights on a 16 GB card, so it only
+    # runs here quantised -- and it is worth running, because the 1B model
+    # stops producing words at about twenty documents while the corpus sizes
+    # this project targets start at hundreds.
+    if args.quantization:
+        kwargs["quantization"] = args.quantization
+        # fp8 is quantised *after* the bf16 weights land on the GPU, so its
+        # peak is the unquantised model and an 8B checkpoint OOMs on a 16 GB
+        # card. bitsandbytes quantises during load, tensor by tensor, and is
+        # the only way this model runs here at all.
+        if args.quantization == "bitsandbytes":
+            kwargs["load_format"] = "bitsandbytes"
+    if args.max_model_len:
+        kwargs["max_model_len"] = args.max_model_len
     if arm == DENSE:
         return LLM(**kwargs)
     from lazy.entrypoints.llm import LazyLLM
@@ -245,10 +259,17 @@ def measure(arm: str, args) -> dict:
         or original(t)) if not hasattr(t, "all_special_tokens_extended") \
         else original(t)
 
-    from lazyroute.corpus import lengthen, load_2wiki, widen
+    from lazyroute.corpus import (lengthen, load_2wiki,
+                                  needle_example, widen)
 
     pool = load_2wiki(limit=max(args.examples * 4, args.docs * 2, 40))
-    if args.doc_paragraphs > 1:
+    if args.needle:
+        # Multi-hop QA collapses into repetition well before the corpus is big
+        # enough for routing to pay for itself; copying one string does not.
+        # See `corpus.needle_example`.
+        examples = [needle_example(args.docs, pool, seed=args.seed + i)
+                    for i in range(args.examples)]
+    elif args.doc_paragraphs > 1:
         # Grow the cache by growing each document rather than by adding more.
         # Same block count, same router cost, but a document count the
         # checkpoint can still answer over.
@@ -645,6 +666,15 @@ def main() -> int:
                              "grows the cache without growing the document "
                              "count -- the router's cost tracks blocks, the "
                              "checkpoint's coherence tracks documents")
+    parser.add_argument("--quantization", default="",
+                        help="vLLM quantization, e.g. fp8. Needed to fit an 8B "
+                             "checkpoint on a 16 GB card")
+    parser.add_argument("--max-model-len", type=int, default=0,
+                        help="cap the context so KV cache fits alongside the "
+                             "weights; 0 uses the checkpoint's own limit")
+    parser.add_argument("--needle", action="store_true",
+                        help="one distinctive fact hidden in the corpus, "
+                             "instead of multi-hop 2wiki")
     parser.add_argument("--examples", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--min-tokens", type=int, default=-1,
@@ -728,7 +758,11 @@ def main() -> int:
                            "--json-dir", _round_dir(args.json_dir, round_index),
                            "--route-layers", args.route_layers,
                            "--batch", str(args.batch),
-                           "--doc-paragraphs", str(args.doc_paragraphs)]
+                           "--doc-paragraphs", str(args.doc_paragraphs),
+                       "--quantization", args.quantization,
+                       "--max-model-len", str(args.max_model_len)]
+                if args.needle:
+                    command.append("--needle")
                 if not args.reorder:
                     command.append("--no-reorder")
                 result = subprocess.run(command, cwd=_REPO)

@@ -241,3 +241,58 @@ def lengthen(example: Example,
                    documents=documents,
                    supporting=supporting,
                    example_id=example.example_id)
+
+
+NEEDLE_TITLE = "Aurora Station Operations Log"
+NEEDLE_TEXT = ("Routine maintenance was completed on schedule. The access code "
+               "for the Aurora vault is MERIDIAN-7742. All duty personnel are "
+               "required to memorise this code and must not write it down.")
+NEEDLE_QUESTION = "What is the access code for the Aurora vault?"
+NEEDLE_ANSWER = "MERIDIAN-7742"
+
+
+def needle_example(num_documents: int,
+                   pool: Sequence[Example],
+                   position: int | None = None,
+                   seed: int = 0) -> Example:
+    """One distinctive fact hidden in a corpus of unrelated paragraphs.
+
+    Multi-hop 2wiki asks the model to find two documents, combine them, and
+    phrase an answer. This asks it to find one document and copy thirteen
+    characters. Both are retrieval, but the second needs almost nothing of the
+    model beyond attending to the right page -- so it survives a longer context
+    than the QA task does, and it is the honest way to show *text* at a corpus
+    size where the QA task has already collapsed into repetition.
+
+    The needle is formatted exactly like every other document, so nothing but
+    its content distinguishes it: no length tell, no position tell, and it sits
+    where `position` says rather than at either end, since the first and last
+    documents are the two the attention finds for free.
+    """
+    if num_documents < 1:
+        raise ValueError("a needle corpus needs at least one document")
+    where = (num_documents // 2) if position is None else position
+    if not 0 <= where < num_documents:
+        raise ValueError(f"position {where} outside 0..{num_documents - 1}")
+
+    rng = random.Random(seed)
+    distractors = []
+    for document in distractor_pool(pool):
+        if NEEDLE_ANSWER.lower() in document.lower():
+            continue
+        distractors.append(document)
+        if len(distractors) >= num_documents - 1:
+            break
+    if len(distractors) < num_documents - 1:
+        distractors = [distractors[i % max(len(distractors), 1)]
+                       for i in range(num_documents - 1)]
+    rng.shuffle(distractors)
+
+    documents = (distractors[:where]
+                 + [format_document(NEEDLE_TITLE, NEEDLE_TEXT)]
+                 + distractors[where:])
+    return Example(question=NEEDLE_QUESTION,
+                   answer=NEEDLE_ANSWER,
+                   documents=documents,
+                   supporting=[where],
+                   example_id="needle")
