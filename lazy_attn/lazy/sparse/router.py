@@ -49,6 +49,7 @@ from typing import Optional
 import torch
 
 from lazy.sparse.descriptors import MAX, MEAN, MIN, DescriptorStore
+from lazy.sparse.scoring import can_fuse, score_blocks
 
 # Ceiling on the elements materialised by one scoring tile, in fp32. The
 # gather that broadcasts each document's query out to its pages is the router's
@@ -260,7 +261,18 @@ class Router:
         Undescribed blocks score `+inf`: a lifecycle bug degrades this into a
         dense read rather than into scoring one document's keys against
         another's statistics.
+
+        The default scorer runs as one fused kernel, which needs no tiling
+        because it never materialises the query broadcast the tiling existed to
+        bound. The torch path below stays for the evaluation scorers and for
+        descriptor dtypes the kernel does not load, and
+        `tests/sparse/test_scoring.py` holds the two to each other.
         """
+        desc, valid_all = self.store.raw(layer_name)
+        if can_fuse(self.config.scorer, desc):
+            return score_blocks(q_by_doc, desc, valid_all, phys, doc_id,
+                                num_kv_heads, self.config.gqa_agg)
+
         num_reqs, max_blocks = phys.shape
         group = q_by_doc.shape[2] // num_kv_heads
         scores = torch.full((num_reqs, max_blocks),

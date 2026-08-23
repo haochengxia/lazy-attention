@@ -163,6 +163,18 @@ class DescriptorStore:
         # described so the router reads it instead of scoring against infinity.
         valid[block_ids] = valid_lens > 0
 
+    def raw(self, layer_name: str):
+        """`(desc, valid)` for a layer, unindexed, or `(None, None)`.
+
+        For the fused scorer, which indexes inside its own kernel rather than
+        asking torch to build a gathered copy first -- that copy is most of what
+        `boxes` costs.
+        """
+        desc = self._desc.get(layer_name)
+        if desc is None:
+            return None, None
+        return desc, self._valid[layer_name]
+
     def boxes(self, layer_name: str,
               block_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """`([N, kv_head, 2, head_size], [N])` -- boxes and their validity.
