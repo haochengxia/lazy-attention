@@ -353,7 +353,12 @@ def summarise(data: dict) -> dict:
         ttfts.append(events[0][0])
         if len(events) > 1:
             itls.append((events[-1][0] - events[0][0]) / (len(events) - 1))
+    ends = [t["end_ms"] for t in data["timelines"] if t["events"]]
     return {
+        # Median too, and for the same reason: the panel shows TTFT, rate and
+        # total together, so all three have to describe the same typical
+        # request or the arithmetic between them visibly fails to close.
+        "end_ms": statistics.median(ends) if ends else float("nan"),
         "ttft_ms": statistics.median(ttfts) if ttfts else float("nan"),
         "itl_ms": sum(itls) / len(itls) if itls else float("nan"),
         "tokens": (sum(len(t["events"]) for t in data["timelines"])
@@ -474,9 +479,13 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
             d.text((bx, p_top + 14), LABELS[arm], font=f_head, fill=accent)
             d.text((bx, p_top + 40), BLURBS[arm], font=f_note, fill=DIM)
 
+            # The animation is driven by one request's timeline; the numbers on
+            # the panel are the arm's medians. So the bar starts filling when
+            # *this* request's first token landed, but what is printed is the
+            # typical one -- the figure is a summary, not an anecdote.
             ttft = side["ttft_ms"]
             started = ttft is not None and t_ms >= ttft
-            badge = (f"first token @ {ttft:,.0f} ms" if started
+            badge = (f"first token @ {stats[arm]['ttft_ms']:,.0f} ms" if started
                      else "prefilling …")
             d.text((bx, p_top + 66), badge, font=f_badge,
                    fill=accent if started else DIM)
@@ -513,7 +522,7 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
             d.text((bx, p_top + 356), "TOTAL REQUEST TIME", font=f_cap,
                    fill=DIM)
             if finished:
-                total = f"{side['end_ms'] / 1000:.2f}"
+                total = f"{stats[arm]['end_ms'] / 1000:.2f}"
                 d.text((bx, p_top + 374), total, font=f_big, fill=WHITE)
                 d.text((bx + f_big.getlength(total) + 8, p_top + 400), "s",
                        font=f_unit, fill=DIM)
@@ -533,10 +542,20 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
         if final:
             ttft_gain = stats[DENSE]["ttft_ms"] / max(stats[LAZY]["ttft_ms"],
                                                       1e-9)
-            message = (f"first token {ttft_gain:,.0f}x sooner   ·   "
-                       f"{stats[LAZY]['itl_ms']:.1f} vs "
-                       f"{stats[DENSE]['itl_ms']:.1f} ms/token   ·   "
-                       f"LazyRoute reads {kept:.0%} of the cache")
+            # Claim the decode win only if it is there. Sparsity was a net loss
+            # at batch 1 until the selector was fused, and this line should
+            # report whichever way the measurement actually came out rather
+            # than assume the flattering one.
+            decode_gain = stats[LAZY]["itl_ms"] / max(stats[ROUTE]["itl_ms"],
+                                                      1e-9)
+            if decode_gain >= 1.02:
+                decode = (f"then {decode_gain:.2f}x faster per token "
+                          f"reading {kept:.0%} of the cache")
+            else:
+                decode = (f"{stats[ROUTE]['itl_ms']:.1f} vs "
+                          f"{stats[LAZY]['itl_ms']:.1f} ms/token   ·   "
+                          f"LazyRoute reads {kept:.0%} of the cache")
+            message = f"first token {ttft_gain:,.0f}x sooner   ·   {decode}"
             width = f_clock.getlength(message)
             d.text((W - M - width, H - 34), message, font=f_clock, fill=CYAN)
         return image
@@ -577,6 +596,38 @@ def report(arms: dict) -> None:
 
 # --------------------------------------------------------------------------
 
+def _representative_index(arms: dict) -> int:
+    """The example to animate: the one that behaves like the medians reported.
+
+    The panels print each arm's median, but the bars fill from one particular
+    request. Animating example 0 lets those disagree -- and they did: a frame
+    showed LazyRoute trailing Lazy-Attn while the final card said it was 1.13x
+    faster, which reads as a figure caught lying about its own footage. So pick
+    the example whose pace is closest to typical *in every arm at once*,
+    scoring by relative deviation so an arm is not favoured for being slow.
+
+    One index for all three panels, never one per arm: the arms are racing the
+    same question, and picking each arm's favourite request would quietly make
+    that untrue.
+    """
+    stats = {arm: summarise(arms[arm]) for arm in ARMS}
+    count = min(len(arms[arm]["timelines"]) for arm in ARMS)
+    best, best_cost = 0, float("inf")
+    for index in range(count):
+        cost = 0.0
+        for arm in ARMS:
+            events = arms[arm]["timelines"][index]["events"]
+            if len(events) < 2:
+                cost = float("inf")
+                break
+            itl = (events[-1][0] - events[0][0]) / (len(events) - 1)
+            typical = max(stats[arm]["itl_ms"], 1e-9)
+            cost += abs(itl - typical) / typical
+        if cost < best_cost:
+            best, best_cost = index, cost
+    return best
+
+
 def _round_dir(json_dir: str, round_index: int) -> str:
     return json_dir if round_index == 0 else os.path.join(
         json_dir, f"round{round_index}")
@@ -615,7 +666,9 @@ def main() -> int:
                         help="measure one arm and write its timeline")
     parser.add_argument("--render", action="store_true",
                         help="render from saved timelines, no GPU needed")
-    parser.add_argument("--gif-example", type=int, default=0)
+    parser.add_argument("--gif-example", type=int, default=-1,
+                        help="which example to animate; -1 (default) picks the "
+                             "one whose pace matches the reported medians")
     parser.add_argument("--frames", type=int, default=130)
     parser.add_argument("--speed", type=float, default=3.0)
     parser.add_argument("--out", default="analysis/lazyroute_demo.gif")
@@ -696,7 +749,9 @@ def main() -> int:
                 merged["timelines"].extend(data["timelines"])
         arms[arm] = merged
     report(arms)
-    render_gif(arms, args.out, args.gif_example,
+    index = (args.gif_example if args.gif_example >= 0
+             else _representative_index(arms))
+    render_gif(arms, args.out, index,
                frames=args.frames, speed=args.speed)
     return 0
 

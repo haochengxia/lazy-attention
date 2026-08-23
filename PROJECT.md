@@ -1016,6 +1016,25 @@ against 5,400 — means proportionally less to save against a router cost that i
 now small but not zero. The break-even estimate of ~500 documents from the
 previous entry no longer applies and has not been re-derived.
 
+**The demo, re-measured** (`analysis/lazyroute_demo.gif`, 600 documents, three
+round-robin rounds, medians):
+
+| arm | TTFT | ms/token | total | cache read |
+| --- | ---: | ---: | ---: | ---: |
+| vLLM prefix caching | 11,158 ms | 9.05 | 11.95 s | 100% |
+| Lazy-Attn | 131 ms | 10.53 | 1.13 s | 100% |
+| LazyRoute | 134 ms | 9.36 | **1.01 s** | 25.2% |
+
+**85x to the first token, then 1.13x per token reading a quarter of the cache** —
+the framing this figure was originally built for in the morning and could not
+honestly carry until now. Two rendering faults fixed with it, both of the same
+kind: the panels printed each arm's median but filled their bars from example 0,
+so a frame showed LazyRoute trailing while the final card claimed it was faster,
+and "total request time" was that one example's while the rate above it was the
+median, so the two did not multiply out. The animated example is now chosen as
+the one closest to typical in every arm at once, and every printed number is a
+median.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run
