@@ -35,6 +35,50 @@ than stipulated, and the lazy arms are handed the identical reordering.
 `--arm` measures one side and writes its timeline; `--render` rebuilds the GIF
 from three saved timelines without touching the GPU, which is what you want
 while iterating on the drawing.
+
+**Showing the model's actual output needs the 8B checkpoint.** The 1B stops
+producing words at about twenty documents -- dense included, so it is the
+checkpoint and not the sparse path -- while the corpus sizes that make routing
+worth anything start in the hundreds. Two recipes:
+
+    # 1B, 600 documents: where routing currently pays. Counters only; at this
+    # corpus size the 1B emits repetition, so there is no text worth drawing.
+    python benchmarks/lazyroute/demo_speedup.py \
+        --docs 600 --examples 2 --max-tokens 96 --rounds 3 \
+        --out analysis/lazyroute_demo.gif
+
+    # 8B, with real generated text. On a 16 GB card this only loads through
+    # bitsandbytes: fp8 quantises *after* the bf16 weights reach the GPU, so
+    # its peak is the unquantised 15 GB and it OOMs in the embedding loader.
+    python benchmarks/lazyroute/demo_speedup.py \
+        --model ldsjmdy/Tulu3-Block-FT --quantization bitsandbytes \
+        --max-model-len 49152 --gpu-memory-utilization 0.90 \
+        --docs 300 --examples 3 --max-tokens 64 --rounds 2 \
+        --out analysis/lazyroute_demo_8b.gif --json-dir analysis/8b
+
+**On a card that fits the 8B in bf16 (H200, 141 GB), drop the quantisation.**
+`--quantization bitsandbytes` dequantises every linear on every decode step,
+which inflates the non-attention part of the step and therefore shrinks
+sparsity's share of it -- the 0.90x LazyRoute measured under 4-bit is distorted
+*against* routing by an amount this card cannot separate out. Without it:
+
+    python benchmarks/lazyroute/demo_speedup.py \
+        --model ldsjmdy/Tulu3-Block-FT \
+        --docs 1200 --examples 3 --max-tokens 96 --rounds 3 \
+        --gpu-memory-utilization 0.90 --max-model-len 180224 \
+        --out analysis/lazyroute_demo_8b.gif --json-dir analysis/8b
+
+`--docs 1200` because routing's saving scales with the block count while the
+router's cost does not: 600 documents was the break-even on the 1B, and 300 on
+the 8B was measured at half that block count. `--max-model-len` has to cover the
+*padded* corpus, `docs * 144` for these 2wiki paragraphs, plus the tail --
+undersizing it is what made the first 300-document run fail. Keep `--rounds`
+at 3 or more: the arms are separate processes, and any card that boosts will
+otherwise turn its own drift into a between-arm difference.
+
+Add `--needle` for a copy-one-string task instead of multi-hop QA. It is the
+cleaner retrieval test and the one that showed LazyRoute quoting a document's
+first sentence while dropping the page that held the answer.
 """
 from __future__ import annotations
 

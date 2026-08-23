@@ -1049,8 +1049,8 @@ dies at the same place, so it is not task difficulty either.
 bitsandbytes: fp8 quantises *after* the bf16 weights reach the GPU, so its peak
 is the unquantised 15 GB and it OOMs in the embedding loader, while
 bitsandbytes quantises during load — 5.65 GiB of weights, 7.66 GiB of KV cache,
-62,784 tokens. At 300 documents it answers properly, and
-`analysis/lazyroute_demo_8b.gif` shows the three arms' actual output streaming.
+62,784 tokens. At 300 documents it answers properly, with the three arms'
+actual output streaming.
 
 | arm | TTFT | ms/token | total | answer |
 | --- | ---: | ---: | ---: | --- |
@@ -1077,6 +1077,14 @@ the decode step and so shrinks sparsity's share of it — the comparison is
 distorted *against* routing by an amount not measured here. And 300 documents is
 2,700 blocks against the 5,400 at which routing paid on the 1B. Neither is a
 reason to disbelieve the accuracy result, which is the more important one.
+
+So the 8B GIF is **not kept**: 4-bit is the wrong instrument for a speed claim
+and this card has no way to run the comparison without it. The recipe is
+recorded in `benchmarks/lazyroute/demo_speedup.py`'s docstring, both as run here
+and as it should be re-run on an H200 — bf16 with no `--quantization`, 1,200
+documents, three rounds — and the numbers above stand only as the accuracy
+result plus a lower bound on the prefill win. `analysis/lazyroute_demo.gif` (1B,
+600 documents) stays, being an undistorted measurement on this hardware.
 
 ## 10. Immediate next actions (this week)
 
