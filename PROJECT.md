@@ -898,6 +898,62 @@ prefill at 600 documents (77 s against a steady-state 11.3 s) became the
 reported TTFT and an inflated 583x headline. It now uses `statistics.median`,
 and the corrected figure at 600 documents is **88x**.
 
+### 2026-08-23 — long documents do not rescue it, and two earlier numbers were noise
+
+**The idea.** The router's cost tracks blocks and documents; the model's
+coherence tracks documents; §9b puts the 1B checkpoint's limit near 20. So ten
+documents of six thousand tokens is the same cache as six hundred of one
+hundred and thirty, with a document count the checkpoint can still answer over
+— the shape where the accuracy regime and the speed regime finally overlap.
+`corpus.py::lengthen` builds it, placing each supporting paragraph *inside* a
+document rather than at its head, since head placement puts every answer in page
+0, which the sink stripe and prefix closure both keep for free.
+
+**Half of the mechanism is real.** One route call costs 1.095 ms at 10x6k
+against 1.799 ms at 600x130 (`router_profile.py --doc-tokens`): 1.6x cheaper,
+because `derotate_query` and the per-document tables scale with document count.
+And sparsity works exactly as designed at this shape — the decode kernel drops
+from 0.310 to 0.134 ms/layer (n=400, in-process CUDA events), a real 2.8
+ms/token of GPU work removed.
+
+**The other half is not.** Paired adjacent runs, three rounds, batch 1:
+
+| shape | docs | tokens/doc | total | blocks | Lazy-Attn | LazyRoute | Δ ms/token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| short | 600 | 130 | 78k | 5,400 | 10.12 | 10.94 | **+0.8** |
+| long | 10 | 6.1k | 61k | 3,794 | 10.30 | 12.11 | **+1.8** |
+| longer | 10 | 12.1k | 121k | 7,576 | 13.65 | 18.21 | **+4.6** |
+
+Longer documents are *worse*, and doubling the length again is worse still. The
+per-document term the reshaping attacks is not the dominant one: the dominant
+term is 477 host dispatches per call, and that scales with the block count,
+which grows however you grow the cache. **There is no corpus shape that fixes
+this** — fusing selection is the only lever, and it is now the gating item.
+
+**Measurement protocol, learned the hard way.** This card boosts between 850 and
+3090 MHz and cannot be clock-locked under WSL2 (`nvidia-smi -lgc` fails). The
+LazyRoute arm's run-to-run spread is 17–36%; Lazy-Attn's is 1–11%, because the
+router's cost is host time and host time is what varies. A single arm measured
+back-to-back drifted from 1066 to 1827 ms across identical examples. Only
+**paired adjacent runs** — the two arms measured next to each other, differenced
+within a round — are trustworthy at these margins. `demo_speedup.py --rounds N`
+now runs the arms round-robin for this reason.
+
+**Two corrections.** Both of these were reported earlier today from
+non-interleaved runs and both are wrong:
+
+- "LazyRoute 9.89 against Lazy-Attn's 10.75 at 600 documents, the first net
+  win." There is no win. Paired, it is 10.94 against 10.12 — a 0.8 ms/token
+  **loss**. The apparent win was thermal drift between sequential arms.
+- "LazyRoute is 0.55x at ten long documents." Paired, it is 0.85x. The 18.00
+  ms/token behind that figure was a contaminated round; the same configuration
+  measured 10.3 twenty minutes later.
+
+The standing conclusion is unchanged and now better supported: **at batch 1,
+LazyRoute is a net loss at every corpus shape measured**, by 0.8 to 4.6
+ms/token, while removing 2.8 ms/token of real GPU work. The gap is host
+dispatch, not arithmetic.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run

@@ -49,7 +49,8 @@ _vtok.get_cached_tokenizer = lambda t: (
 from vllm import SamplingParams  # noqa: E402
 
 from lazy.entrypoints.llm import LazyLLM  # noqa: E402
-from lazyroute.corpus import load_2wiki, widen  # noqa: E402
+from lazyroute.corpus import (lengthen, load_2wiki,  # noqa: E402
+                              widen)
 
 # Subspan EM, the repo's own 2wiki metric: normalise away case, punctuation and
 # articles on both sides, then ask whether the gold answer appears anywhere in
@@ -71,6 +72,11 @@ def main() -> int:
     # best answer for the question: ..."), so a short budget measures
     # truncation rather than retrieval: at 32 tokens both dense and sparse
     # score ~1/8 purely because the answer had not been reached yet.
+    parser.add_argument("--doc-paragraphs", type=int, default=1,
+                        help="paragraphs per document. >1 grows the cache "
+                             "without growing the document count, which is "
+                             "the shape where routing can pay for itself and "
+                             "the checkpoint is still coherent")
     parser.add_argument("--max-tokens", type=int, default=128)
     # Both arms must batch identically or the comparison is not paired. It is
     # also a memory bound: the router's scoring tile is sized against the batch
@@ -88,10 +94,14 @@ def main() -> int:
     args = parser.parse_args()
 
     pool = load_2wiki(limit=max(args.examples * 4, 40))
-    examples = [
-        widen(ex, args.docs, pool) if args.docs > len(ex.documents) else ex
-        for ex in pool[:args.examples]
-    ]
+    if args.doc_paragraphs > 1:
+        examples = [lengthen(ex, args.docs, args.doc_paragraphs, pool)
+                    for ex in pool[:args.examples]]
+    else:
+        examples = [
+            widen(ex, args.docs, pool) if args.docs > len(ex.documents) else ex
+            for ex in pool[:args.examples]
+        ]
 
     llm = LazyLLM(model=args.model,
                   gpu_memory_utilization=0.85,

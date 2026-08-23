@@ -245,13 +245,20 @@ def measure(arm: str, args) -> dict:
         or original(t)) if not hasattr(t, "all_special_tokens_extended") \
         else original(t)
 
-    from lazyroute.corpus import load_2wiki, widen
+    from lazyroute.corpus import lengthen, load_2wiki, widen
 
     pool = load_2wiki(limit=max(args.examples * 4, args.docs * 2, 40))
-    examples = [
-        widen(ex, args.docs, pool) if args.docs > len(ex.documents) else ex
-        for ex in pool[:args.examples]
-    ]
+    if args.doc_paragraphs > 1:
+        # Grow the cache by growing each document rather than by adding more.
+        # Same block count, same router cost, but a document count the
+        # checkpoint can still answer over.
+        examples = [lengthen(ex, args.docs, args.doc_paragraphs, pool)
+                    for ex in pool[:args.examples]]
+    else:
+        examples = [
+            widen(ex, args.docs, pool) if args.docs > len(ex.documents) else ex
+            for ex in pool[:args.examples]
+        ]
 
     llm = _build_llm(arm, args)
 
@@ -570,6 +577,11 @@ def report(arms: dict) -> None:
 
 # --------------------------------------------------------------------------
 
+def _round_dir(json_dir: str, round_index: int) -> str:
+    return json_dir if round_index == 0 else os.path.join(
+        json_dir, f"round{round_index}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=MODEL)
@@ -577,6 +589,11 @@ def main() -> int:
                         help="cached documents per request; the decode saving "
                              "is proportional to the cache, so a small corpus "
                              "shows the router's overhead and not its point")
+    parser.add_argument("--doc-paragraphs", type=int, default=1,
+                        help="paragraphs concatenated into each document. >1 "
+                             "grows the cache without growing the document "
+                             "count -- the router's cost tracks blocks, the "
+                             "checkpoint's coherence tracks documents")
     parser.add_argument("--examples", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--min-tokens", type=int, default=-1,
@@ -603,10 +620,17 @@ def main() -> int:
     parser.add_argument("--speed", type=float, default=3.0)
     parser.add_argument("--out", default="analysis/lazyroute_demo.gif")
     parser.add_argument("--json-dir", default="analysis")
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="measure every arm this many times, round-robin. "
+                             "The GPU cannot be clock-locked here, so >1 is "
+                             "what makes a decode comparison finer than ~30% "
+                             "mean anything")
     args = parser.parse_args()
 
     paths = {arm: os.path.join(args.json_dir, f"lazyroute_demo_{arm}.json")
              for arm in ARMS}
+    if args.rounds < 1:
+        raise SystemExit("--rounds must be at least 1")
 
     if args.arm:
         data = measure(args.arm, args)
@@ -620,29 +644,52 @@ def main() -> int:
         # Each arm needs its engine switches set before vLLM is imported, and
         # only one 1B engine fits the card at a time, so the arms are separate
         # processes run in turn rather than threads.
-        for arm in ARMS:
-            print(f"\n=== measuring {LABELS[arm]} ===", flush=True)
-            command = [sys.executable, os.path.abspath(__file__),
-                       "--arm", arm, "--model", args.model,
-                       "--docs", str(args.docs),
-                       "--examples", str(args.examples),
-                       "--max-tokens", str(args.max_tokens),
-                       "--min-tokens", str(args.min_tokens),
-                       "--gpu-memory-utilization",
-                       str(args.gpu_memory_utilization),
-                       "--seed", str(args.seed), "--json-dir", args.json_dir,
-                       "--route-layers", args.route_layers,
-                       "--batch", str(args.batch)]
-            if not args.reorder:
-                command.append("--no-reorder")
-            result = subprocess.run(command, cwd=_REPO)
-            if result.returncode != 0:
-                raise SystemExit(f"arm {arm} failed ({result.returncode})")
+        #
+        # Run in turn *round-robin*, not one arm to completion. This card boosts
+        # between 850 MHz and 3090 MHz and cannot be clock-locked under WSL2
+        # (`nvidia-smi -lgc` fails), so a long run drifts: a single arm measured
+        # back-to-back showed its own examples sliding from 1066 ms to 1827 ms.
+        # Sequential arms turn that drift into a between-arm difference, which
+        # is indistinguishable from the effect being measured. Round-robin
+        # spreads it across all three instead, and the per-arm median over
+        # rounds is then comparing like with like.
+        for round_index in range(args.rounds):
+            for arm in ARMS:
+                print(f"\n=== measuring {LABELS[arm]} "
+                      f"(round {round_index + 1}/{args.rounds}) ===",
+                      flush=True)
+                command = [sys.executable, os.path.abspath(__file__),
+                           "--arm", arm, "--model", args.model,
+                           "--docs", str(args.docs),
+                           "--examples", str(args.examples),
+                           "--max-tokens", str(args.max_tokens),
+                           "--min-tokens", str(args.min_tokens),
+                           "--gpu-memory-utilization",
+                           str(args.gpu_memory_utilization),
+                           "--seed", str(args.seed),
+                           "--json-dir", _round_dir(args.json_dir, round_index),
+                           "--route-layers", args.route_layers,
+                           "--batch", str(args.batch),
+                           "--doc-paragraphs", str(args.doc_paragraphs)]
+                if not args.reorder:
+                    command.append("--no-reorder")
+                result = subprocess.run(command, cwd=_REPO)
+                if result.returncode != 0:
+                    raise SystemExit(f"arm {arm} failed ({result.returncode})")
 
     arms = {}
     for arm in ARMS:
-        with open(paths[arm]) as handle:
-            arms[arm] = json.load(handle)
+        merged = None
+        for round_index in range(args.rounds):
+            path = os.path.join(_round_dir(args.json_dir, round_index),
+                                f"lazyroute_demo_{arm}.json")
+            with open(path) as handle:
+                data = json.load(handle)
+            if merged is None:
+                merged = data
+            else:
+                merged["timelines"].extend(data["timelines"])
+        arms[arm] = merged
     report(arms)
     render_gif(arms, args.out, args.gif_example,
                frames=args.frames, speed=args.speed)

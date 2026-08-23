@@ -171,3 +171,73 @@ def widen(example: Example,
                    documents=[documents[idx] for idx in order],
                    supporting=sorted(position[idx] for idx in example.supporting),
                    example_id=example.example_id)
+
+
+def lengthen(example: Example,
+             num_documents: int,
+             paragraphs_per_document: int,
+             pool: Sequence[Example],
+             seed: int = 0) -> Example:
+    """Same cache, spread over fewer and much longer documents.
+
+    `widen` grows a corpus by adding documents; this grows it by growing each
+    one. The distinction matters because the two costs in a sparse decode scale
+    with different things. The router's host cost tracks the number of *blocks*
+    -- 10 documents of 60 paragraphs is the same block count as 600 of one, and
+    the same 477 dispatches -- while the model's coherence tracks the number of
+    *documents*, which §9b puts at roughly 20 for this 1B checkpoint. Long
+    documents are the only shape where a cache big enough for routing to pay
+    for itself and a document count the checkpoint can still answer over are
+    the same corpus.
+
+    Each supporting paragraph is placed *inside* a document rather than at its
+    head, at a position drawn from `seed`. Head placement would put every
+    answer in page 0, which the sink stripe and prefix closure both keep for
+    free -- selection would look excellent without having selected anything.
+    Placed mid-document, finding it is the actual page-level retrieval problem,
+    and it is the regime where page-level selection should beat doc-level by
+    the most (§9b: 0.965 against 0.409 at a 25% budget).
+    """
+    if num_documents < len(example.supporting):
+        raise ValueError(
+            f"lengthen() needs room for every supporting paragraph: asked for "
+            f"{num_documents} documents, the example has "
+            f"{len(example.supporting)} supporting.")
+    if paragraphs_per_document < 1:
+        raise ValueError("paragraphs_per_document must be at least 1")
+
+    rng = random.Random(seed)
+    filler: list[str] = []
+    seen = set(example.documents)
+    needed = num_documents * paragraphs_per_document
+    for document in distractor_pool(pool, exclude=example):
+        if document in seen:
+            continue
+        seen.add(document)
+        filler.append(document)
+        if len(filler) >= needed:
+            break
+    if not filler:
+        raise ValueError("no distractor paragraphs available to lengthen with")
+
+    supporting_text = [example.documents[idx] for idx in example.supporting]
+    documents, supporting = [], []
+    cursor = 0
+    for index in range(num_documents):
+        # Cycle the filler if the pool is smaller than the corpus asked for;
+        # repeated distractors are still distractors, and the alternative is
+        # silently building a shorter corpus than was requested.
+        parts = [filler[(cursor + k) % len(filler)]
+                 for k in range(paragraphs_per_document)]
+        cursor += paragraphs_per_document
+        if index < len(supporting_text):
+            where = rng.randrange(paragraphs_per_document)
+            parts[where] = supporting_text[index]
+            supporting.append(index)
+        documents.append("".join(parts))
+
+    return Example(question=example.question,
+                   answer=example.answer,
+                   documents=documents,
+                   supporting=supporting,
+                   example_id=example.example_id)
