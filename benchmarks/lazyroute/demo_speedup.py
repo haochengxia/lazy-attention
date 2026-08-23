@@ -117,7 +117,7 @@ def _build_llm(arm: str, args):
                   enable_prefix_caching=True,
                   trust_remote_code=True,
                   enforce_eager=True,
-                  max_num_seqs=1)
+                  max_num_seqs=args.batch)
     if arm == DENSE:
         return LLM(**kwargs)
     from lazy.entrypoints.llm import LazyLLM
@@ -161,6 +161,45 @@ def _stream(llm, arm: str, blocks: list[str], tail: str,
     return {"events": events,
             "end_ms": (time.perf_counter() - start) * 1e3,
             "ttft_ms": events[0][0] if events else None}
+
+
+def _stream_many(llm, arm: str, requests: list, max_tokens: int,
+                 min_tokens: int) -> list[dict]:
+    """Run several requests concurrently, timestamping each one's tokens.
+
+    Batch 1 is the wrong regime to judge sparsity in: once the decode kernel is
+    fast, a single-sequence step is bound by the CPU issuing launches, so
+    removing GPU work is invisible. Concurrency raises the GPU work behind each
+    launch without raising the launch count, which is where a saving in bytes
+    read should start to show as a saving in time.
+    """
+    from vllm import SamplingParams
+    from vllm.sampling_params import RequestOutputKind
+
+    params = SamplingParams(temperature=0.0, max_tokens=max_tokens,
+                            min_tokens=min_tokens)
+    params.output_kind = RequestOutputKind.DELTA
+    for blocks, tail in requests:
+        if arm == DENSE:
+            llm._add_request("".join(blocks) + tail, params)
+        else:
+            llm._add_request(tail, params, document_seq=blocks)
+
+    start = time.perf_counter()
+    events: dict = {}
+    end_ms: dict = {}
+    while llm.llm_engine.has_unfinished_requests():
+        for output in llm.llm_engine.step():
+            now = (time.perf_counter() - start) * 1e3
+            if output.outputs[0].token_ids:
+                events.setdefault(output.request_id, []).append(
+                    [now, output.outputs[0].text])
+                end_ms[output.request_id] = now
+    return [{
+        "events": events.get(rid, []),
+        "end_ms": end_ms.get(rid, (time.perf_counter() - start) * 1e3),
+        "ttft_ms": events[rid][0][0] if events.get(rid) else None,
+    } for rid in sorted(events, key=int)]
 
 
 def _warm(llm, arm: str, blocks: list[str], tail: str) -> None:
@@ -214,7 +253,25 @@ def measure(arm: str, args) -> dict:
     min_tokens = args.max_tokens if args.min_tokens < 0 else args.min_tokens
 
     timelines = []
-    for index, example in enumerate(examples):
+    if args.batch > 1:
+        prepared = []
+        for index, example in enumerate(examples[:args.batch]):
+            blocks, tail = example.blocks(), example.prompt()
+            _warm(llm, arm, blocks, tail)
+            if args.reorder:
+                order = _reorder(len(blocks) - 1, args.seed + index)
+                blocks = [blocks[0]] + [blocks[1 + j] for j in order]
+            prepared.append((blocks, tail))
+        timelines = _stream_many(llm, arm, prepared, args.max_tokens,
+                                 min_tokens)
+        for index, timeline in enumerate(timelines):
+            timeline["question"] = examples[index].question
+            timeline["answer"] = examples[index].answer
+            print(f"[{arm}] batch row {index}: "
+                  f"{len(timeline['events'])} tokens, "
+                  f"end {timeline['end_ms']:.0f} ms", flush=True)
+        examples = examples[:args.batch]
+    for index, example in ([] if args.batch > 1 else enumerate(examples)):
         blocks, tail = example.blocks(), example.prompt()
         _warm(llm, arm, blocks, tail)
         # Same documents, new order. Lazy reuses every block wherever it lands;
@@ -479,6 +536,10 @@ def main() -> int:
                         help="-1 (default) pins it to --max-tokens so every "
                              "arm decodes the same number of steps")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--batch", type=int, default=1,
+                        help="concurrent requests. Batch 1 decode is "
+                             "CPU-launch-bound once the kernel is fast, which "
+                             "hides any GPU work sparsity removes")
     parser.add_argument("--no-reorder", dest="reorder", action="store_false",
                         help="serve the documents in their cached order; the "
                              "dense arm then hits its prefix cache")
@@ -523,7 +584,8 @@ def main() -> int:
                        "--gpu-memory-utilization",
                        str(args.gpu_memory_utilization),
                        "--seed", str(args.seed), "--json-dir", args.json_dir,
-                       "--route-layers", args.route_layers]
+                       "--route-layers", args.route_layers,
+                       "--batch", str(args.batch)]
         if not args.reorder:
             command.append("--no-reorder")
             result = subprocess.run(command, cwd=_REPO)

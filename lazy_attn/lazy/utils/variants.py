@@ -234,6 +234,18 @@ def lazy_decode_wrapper_profile_enabled() -> bool:
     return _env_flag("LAZY_DECODE_WRAPPER_PROFILE")
 
 
+def lazy_split_kv_enabled() -> bool:
+    """Split the decode block walk across programs (flash-decoding).
+
+    The default kernel launches `(num_seqs, num_kv_heads)` programs -- eight at
+    batch 1 on this model, on a 70-SM card -- and each walks the whole block
+    table serially. Off by default because it is a second decode kernel rather
+    than a change to the first one, per design rule R1; `tests/kernels/
+    test_split_decode.py` holds the two to each other.
+    """
+    return _env_flag("LAZY_SPLIT_KV")
+
+
 # -- Sparse decode (LazyRoute) ------------------------------------------------
 # Read once at import by the router and the descriptor store; `LAZY_SPARSE`
 # itself gates whether any of the rest is consulted.

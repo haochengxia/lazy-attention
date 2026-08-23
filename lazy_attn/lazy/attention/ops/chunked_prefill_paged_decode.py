@@ -11,6 +11,7 @@ from lazy.utils.variants import (
     lazy_decode_ignore_q_mask_enabled,
     lazy_decode_wrapper_profile_enabled,
     lazy_force_split_decode_enabled,
+    lazy_split_kv_enabled,
     no_lazy_enabled,
 )
 
@@ -18,6 +19,112 @@ from lazy.attention.ops.models.llama_v1 import (
     kernel_paged_attention_2d_llama,
     kernel_paged_attention_2d_llama_lazy_only,
 )
+from lazy.attention.ops.models.llama_split import (
+    allocate_partials,
+    choose_splits,
+    kernel_paged_decode_combine,
+    kernel_paged_decode_split,
+)
+
+
+def _launch_split_decode(*, output, query, key_cache, value_cache,
+                         decode_block_table, decode_lens, alibi_slopes,
+                         sm_scale, k_scale, v_scale, num_seqs,
+                         num_query_heads, num_kv_heads, num_queries_per_kv,
+                         num_queries_per_kv_padded, IN_PRECISION, block_size,
+                         head_size, use_alibi_slopes, sliding_window,
+                         query_start_loc, rotary_dim, is_lazy, cos_sin_cache,
+                         max_seq_len, ignore_q_mask, compute_cos_sin,
+                         rope_kw):
+    """Two passes: partial softmaxes over split ranges, then a merge.
+
+    `max_seq_len` is the dense length even when a compacted walk table is in
+    play, so the split count is an over-estimate for a sparse decode. That is
+    the safe direction: a split past the end of the walk writes `m = -inf` and
+    the merge gives it zero weight.
+    """
+    head_size_padded = triton.next_power_of_2(head_size)
+    splits = choose_splits(num_seqs, num_kv_heads,
+                           triton.cdiv(max_seq_len, block_size),
+                           torch.cuda.get_device_properties(
+                               query.device).multi_processor_count)
+    partial_acc, partial_m, partial_l = allocate_partials(
+        num_seqs, num_kv_heads, splits, num_queries_per_kv_padded,
+        head_size_padded, query.device)
+
+    kernel_paged_decode_split[(num_seqs, num_kv_heads, splits)](
+        partial_acc_ptr=partial_acc,
+        partial_m_ptr=partial_m,
+        partial_l_ptr=partial_l,
+        query_ptr=query,
+        key_cache_ptr=key_cache,
+        value_cache_ptr=value_cache,
+        block_tables_ptr=decode_block_table,
+        seq_lens_ptr=decode_lens,
+        alibi_slopes_ptr=alibi_slopes,
+        scale=sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        num_queries_per_kv_padded=num_queries_per_kv_padded,
+        block_table_stride=decode_block_table.stride(0),
+        query_stride_0=query.stride(0),
+        query_stride_1=query.stride(1),
+        stride_pa_0=partial_acc.stride(0),
+        stride_pa_1=partial_acc.stride(1),
+        stride_pa_2=partial_acc.stride(2),
+        stride_pm_0=partial_m.stride(0),
+        stride_pm_1=partial_m.stride(1),
+        stride_pm_2=partial_m.stride(2),
+        IN_PRECISION=IN_PRECISION,
+        BLOCK_SIZE=block_size,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=head_size_padded,
+        USE_ALIBI_SLOPES=use_alibi_slopes,
+        SLIDING_WINDOW=sliding_window,
+        x=key_cache.shape[4],
+        stride_k_cache_0=key_cache.stride(0),
+        stride_k_cache_1=key_cache.stride(1),
+        stride_k_cache_2=key_cache.stride(2),
+        stride_k_cache_3=key_cache.stride(3),
+        stride_k_cache_4=key_cache.stride(4),
+        stride_v_cache_0=value_cache.stride(0),
+        stride_v_cache_1=value_cache.stride(1),
+        stride_v_cache_2=value_cache.stride(2),
+        stride_v_cache_3=value_cache.stride(3),
+        filter_by_query_len=True,
+        query_start_len_ptr=query_start_loc,
+        rotary_dim=rotary_dim,
+        is_lazy_ptr=is_lazy,
+        cos_sin_cache_ptr=cos_sin_cache,
+        NUM_SPLITS=splits,
+        IGNORE_Q_MASK=ignore_q_mask,
+        COMPUTE_COS_SIN=compute_cos_sin,
+        **rope_kw,
+    )
+    kernel_paged_decode_combine[(num_seqs, num_kv_heads)](
+        output_ptr=output,
+        partial_acc_ptr=partial_acc,
+        partial_m_ptr=partial_m,
+        partial_l_ptr=partial_l,
+        query_start_len_ptr=query_start_loc,
+        output_stride_0=output.stride(0),
+        output_stride_1=output.stride(1),
+        stride_pa_0=partial_acc.stride(0),
+        stride_pa_1=partial_acc.stride(1),
+        stride_pa_2=partial_acc.stride(2),
+        stride_pm_0=partial_m.stride(0),
+        stride_pm_1=partial_m.stride(1),
+        stride_pm_2=partial_m.stride(2),
+        num_query_heads=num_query_heads,
+        num_queries_per_kv=num_queries_per_kv,
+        num_queries_per_kv_padded=num_queries_per_kv_padded,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=head_size_padded,
+        NUM_SPLITS=splits,
+        filter_by_query_len=True,
+    )
 
 
 def _cuda_elapsed_ms(start_event, end_event):
@@ -186,57 +293,75 @@ def chunked_prefill_paged_decode(
         if profile_decode:
             total_start.record()
             kernel_start.record()
-        decode_kernel[(
-                num_seqs,
-                num_kv_heads,
-            )](
-                output_ptr=output,
-                query_ptr=query,
-                key_cache_ptr=key_cache,
-                value_cache_ptr=value_cache,
-                block_tables_ptr=decode_block_table,
-                seq_lens_ptr=decode_lens,
-                alibi_slopes_ptr=alibi_slopes,
-                scale=sm_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                num_query_heads=num_query_heads,
+        if lazy_split_kv_enabled() and not use_split_decode:
+            _launch_split_decode(
+                output=output, query=query, key_cache=key_cache,
+                value_cache=value_cache, decode_block_table=decode_block_table,
+                decode_lens=decode_lens, alibi_slopes=alibi_slopes,
+                sm_scale=sm_scale, k_scale=k_scale, v_scale=v_scale,
+                num_seqs=num_seqs, num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
                 num_queries_per_kv=num_queries_per_kv,
                 num_queries_per_kv_padded=num_queries_per_kv_padded,
-                block_table_stride=decode_block_table.stride(0),
-                query_stride_0=query.stride(0),
-                query_stride_1=query.stride(1),
-                output_stride_0=output.stride(0),
-                output_stride_1=output.stride(1),
-                IN_PRECISION=IN_PRECISION,
-                BLOCK_SIZE=block_size,
-                HEAD_SIZE=head_size,
-                HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-                USE_ALIBI_SLOPES=use_alibi_slopes,
-                SLIDING_WINDOW=sliding_window,
-                x=key_cache.shape[4],
-                stride_k_cache_0=key_cache.stride(0),
-                stride_k_cache_1=key_cache.stride(1),
-                stride_k_cache_2=key_cache.stride(2),
-                stride_k_cache_3=key_cache.stride(3),
-                stride_k_cache_4=key_cache.stride(4),
-                stride_v_cache_0=value_cache.stride(0),
-                stride_v_cache_1=value_cache.stride(1),
-                stride_v_cache_2=value_cache.stride(2),
-                stride_v_cache_3=value_cache.stride(3),
-                filter_by_query_len=True,
-                query_start_len_ptr=query_start_loc,
-                rotary_dim=rotary_dim,
-                rotary_dim_pow2=triton.next_power_of_2(rotary_dim),  # padded
-                is_neox_style=is_neox_style,
-                is_lazy_ptr=is_lazy,
-                q_offset_ptr=q_offset,
-                q_mask_ptr=q_mask,
-                cos_sin_cache_ptr=cos_sin_cache,
-                IGNORE_Q_MASK=ignore_q_mask,
-                COMPUTE_COS_SIN=compute_cos_sin,
-                **rope_kw,
-            )
+                IN_PRECISION=IN_PRECISION, block_size=block_size,
+                head_size=head_size, use_alibi_slopes=use_alibi_slopes,
+                sliding_window=sliding_window,
+                query_start_loc=query_start_loc, rotary_dim=rotary_dim,
+                is_lazy=is_lazy, cos_sin_cache=cos_sin_cache,
+                max_seq_len=max_seq_len, ignore_q_mask=ignore_q_mask,
+                compute_cos_sin=compute_cos_sin, rope_kw=rope_kw)
+        else:
+                decode_kernel[(
+                    num_seqs,
+                    num_kv_heads,
+                )](
+                    output_ptr=output,
+                    query_ptr=query,
+                    key_cache_ptr=key_cache,
+                    value_cache_ptr=value_cache,
+                    block_tables_ptr=decode_block_table,
+                    seq_lens_ptr=decode_lens,
+                    alibi_slopes_ptr=alibi_slopes,
+                    scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    num_query_heads=num_query_heads,
+                    num_queries_per_kv=num_queries_per_kv,
+                    num_queries_per_kv_padded=num_queries_per_kv_padded,
+                    block_table_stride=decode_block_table.stride(0),
+                    query_stride_0=query.stride(0),
+                    query_stride_1=query.stride(1),
+                    output_stride_0=output.stride(0),
+                    output_stride_1=output.stride(1),
+                    IN_PRECISION=IN_PRECISION,
+                    BLOCK_SIZE=block_size,
+                    HEAD_SIZE=head_size,
+                    HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+                    USE_ALIBI_SLOPES=use_alibi_slopes,
+                    SLIDING_WINDOW=sliding_window,
+                    x=key_cache.shape[4],
+                    stride_k_cache_0=key_cache.stride(0),
+                    stride_k_cache_1=key_cache.stride(1),
+                    stride_k_cache_2=key_cache.stride(2),
+                    stride_k_cache_3=key_cache.stride(3),
+                    stride_k_cache_4=key_cache.stride(4),
+                    stride_v_cache_0=value_cache.stride(0),
+                    stride_v_cache_1=value_cache.stride(1),
+                    stride_v_cache_2=value_cache.stride(2),
+                    stride_v_cache_3=value_cache.stride(3),
+                    filter_by_query_len=True,
+                    query_start_len_ptr=query_start_loc,
+                    rotary_dim=rotary_dim,
+                    rotary_dim_pow2=triton.next_power_of_2(rotary_dim),  # padded
+                    is_neox_style=is_neox_style,
+                    is_lazy_ptr=is_lazy,
+                    q_offset_ptr=q_offset,
+                    q_mask_ptr=q_mask,
+                    cos_sin_cache_ptr=cos_sin_cache,
+                    IGNORE_Q_MASK=ignore_q_mask,
+                    COMPUTE_COS_SIN=compute_cos_sin,
+                    **rope_kw,
+                )
         if profile_decode:
             kernel_end.record()
             total_end.record()
