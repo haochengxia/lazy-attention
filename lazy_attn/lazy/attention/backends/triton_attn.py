@@ -26,6 +26,7 @@ from lazy.utils.variants import (
     lazy_sparse_enabled,
     lazy_sparse_gqa_agg,
     lazy_sparse_granularity,
+    lazy_sparse_fused_select_enabled,
     lazy_sparse_keep_doc0,
     lazy_sparse_refresh,
     lazy_sparse_route_layer_stride,
@@ -83,6 +84,7 @@ def get_router() -> Router:
                 with_mean=scorer == "centroid",
             ),
             profile_every=_env_int("LAZY_SPARSE_PROFILE", 0),
+            fused_select=lazy_sparse_fused_select_enabled(),
         )
     return _ROUTER
 

@@ -578,6 +578,7 @@ class LazyGPUModelRunner(GPUModelRunner):
                 # inherits, since a recycled object would otherwise hand a later
                 # step a walk table built for an earlier one.
                 metadata.lazy_route_geometry = None
+                metadata.lazy_route_geometry_fused = None
                 metadata.lazy_walk_table = None
 
     def _prepare_inputs(

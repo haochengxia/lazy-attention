@@ -55,6 +55,7 @@ import torch
 
 from lazy.sparse.descriptors import MAX, MEAN, MIN, DescriptorStore
 from lazy.sparse.scoring import can_fuse, score_blocks
+from lazy.sparse.selection import can_fuse_selection, select_and_compact
 
 # Ceiling on the elements materialised by one scoring tile, in fp32. The
 # gather that broadcasts each document's query out to its pages is the router's
@@ -111,6 +112,22 @@ class WalkTable:
     seq_lens: torch.Tensor  # [num_reqs] int32
     rows_kept: Optional[torch.Tensor] = None  # [num_reqs] int32, for probes
     rows_dense: Optional[torch.Tensor] = None  # [num_reqs] int32, for probes
+
+
+@dataclass
+class FusedGeometry:
+    """The little of `RouteGeometry` the fused path still needs on the host.
+
+    The kernel derives block validity, the document mask, the budget and the
+    stripe itself, so none of that has to be built here -- which is the point,
+    since building it was about forty dispatches per step. What survives is
+    only what the *scorer* consumes: the narrowed table, its physical block
+    ids, and the per-document rotation offsets.
+    """
+    packed: torch.Tensor
+    phys: torch.Tensor
+    doc_id: torch.Tensor
+    doc_offsets: torch.Tensor
 
 
 @dataclass
@@ -230,10 +247,16 @@ class Router:
     def __init__(self,
                  config: RouterConfig,
                  store: DescriptorStore,
-                 profile_every: int = 0):
+                 profile_every: int = 0,
+                 fused_select: bool = True):
         self.config = config
         self.store = store
         self.profile_every = profile_every
+        # Whether selection runs as one kernel or as the torch path it was
+        # written against. Both are kept: the torch path is the reference the
+        # equivalence tests compare to, and the switch is how a suspected
+        # kernel bug gets bisected without editing either.
+        self.fused_select = fused_select
         # Walk-length accounting. The decode kernel reads whole rows, so rows
         # kept over rows dense *is* the bytes/token ratio for the cached part
         # of attention -- the number P2.3 has to report, and the cheapest
@@ -434,6 +457,20 @@ class Router:
             forced=forced,
             block_size=block_size)
 
+    def _geometry_light(self, packed: torch.Tensor, doc_id: torch.Tensor,
+                        doc_offsets: torch.Tensor,
+                        max_blocks: Optional[int]) -> FusedGeometry:
+        """`_geometry`'s narrowing and nothing else. See `FusedGeometry`."""
+        if max_blocks is not None:
+            width = max(min(max_blocks, packed.shape[1]), 1)
+            packed = packed[:, :width]
+            doc_id = doc_id[:, :width]
+            doc_offsets = doc_offsets[:, :width]
+        return FusedGeometry(packed=packed,
+                             phys=(packed >> 32).to(torch.int64),
+                             doc_id=doc_id,
+                             doc_offsets=doc_offsets)
+
     def _select(self, scores: torch.Tensor,
                 geometry: RouteGeometry) -> torch.Tensor:
         """`[R, MB]` bool: which rows this step walks."""
@@ -614,6 +651,16 @@ class Router:
         below.
         """
         self._ensure_counters(packed.device)
+
+        width = (packed.shape[1] if max_blocks is None
+                 else max(min(max_blocks, packed.shape[1]), 1))
+        if self.fused_select and can_fuse_selection(self.config, width):
+            return self._route_fused(layer_name, query, packed, seq_lens,
+                                     doc_id, num_doc_blocks, doc_offsets,
+                                     routable, query_start_loc, cos_sin_cache,
+                                     rotary_dim, num_kv_heads, block_size,
+                                     key_cache, max_blocks, step_cache)
+
         geometry = getattr(step_cache, "lazy_route_geometry", None)
         if geometry is None:
             geometry = self._geometry(packed, seq_lens, doc_id, doc_offsets,
@@ -647,6 +694,46 @@ class Router:
         self._stat_dense += rows_dense.sum()
         self._maybe_log()
         return WalkTable(walk, out_lens, rows_kept, rows_dense)
+
+    def _route_fused(self, layer_name: str, query: torch.Tensor,
+                     packed: torch.Tensor, seq_lens: torch.Tensor,
+                     doc_id: torch.Tensor, num_doc_blocks: torch.Tensor,
+                     doc_offsets: torch.Tensor, routable: torch.Tensor,
+                     query_start_loc: torch.Tensor,
+                     cos_sin_cache: torch.Tensor, rotary_dim: int,
+                     num_kv_heads: int, block_size: int,
+                     key_cache: Optional[torch.Tensor],
+                     max_blocks: Optional[int],
+                     step_cache: object) -> WalkTable:
+        """`route`, with everything after scoring in one kernel.
+
+        Same selection as the torch path -- `tests/sparse/test_selection.py`
+        holds them to each other -- reached in about fifteen host operations
+        instead of 477. The counters are accumulated inside the kernel, so
+        `sync_stats` still reports `kept_fraction`, but the per-request row
+        counts on `WalkTable` are not materialised: nothing reads them, and
+        producing them would put two reductions back on the path.
+        """
+        geometry = getattr(step_cache, "lazy_route_geometry_fused", None)
+        if geometry is None:
+            geometry = self._geometry_light(packed, doc_id, doc_offsets,
+                                            max_blocks)
+            if step_cache is not None:
+                step_cache.lazy_route_geometry_fused = geometry
+
+        q = query[query_start_loc[:geometry.packed.shape[0]].long()]
+        q_by_doc = derotate_query(q, geometry.doc_offsets, cos_sin_cache,
+                                  rotary_dim)
+        scores = self._score_blocks(layer_name, q_by_doc, geometry.phys,
+                                    geometry.doc_id, num_kv_heads, key_cache)
+
+        walk, out_lens = select_and_compact(
+            geometry.packed, scores, geometry.doc_id, seq_lens,
+            num_doc_blocks, routable, block_size, self.config,
+            self._stat_kept, self._stat_dense, self._stat_guard)
+        self.stats["calls"] += 1
+        self._maybe_log()
+        return WalkTable(walk, out_lens)
 
     def sync_stats(self) -> dict:
         """Materialise the device counters into `self.stats` and return it.

@@ -89,6 +89,10 @@ are allocated, hashed, evicted or packed.
                                   layer's own query, which is what Phase 0
                                   measured and costs 14x as much for no
                                   measured gain (§9b).
+    LAZY_SPARSE_FUSED_SELECT      on by default. Selection, compaction and the
+                                  walk-table build as one kernel instead of
+                                  ~470 dispatches; 0 falls back to the torch
+                                  reference path.
     LAZY_SPARSE_DENSE_PREFIX_LAYERS  int, default 2. Leading layers left dense
                                   (Quest convention).
     LAZY_SPARSE_REFRESH           every (default) | onchange | int N -- how
@@ -122,6 +126,18 @@ _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name)
     return value is not None and value.strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _env_flag_default_on(name: str) -> bool:
+    """A flag that is on unless explicitly turned off.
+
+    For switches whose default *is* the shipped behaviour and which exist so a
+    suspected kernel bug can be bisected against the reference path.
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return True
+    return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
 def _env_choice(name: str, choices: tuple[str, ...], default: str) -> str:
@@ -319,6 +335,17 @@ def lazy_sparse_route_layer_stride() -> int:
         raise ValueError(
             f"Unsupported LAZY_SPARSE_ROUTE_LAYERS='{value}'. Expected "
             f"'all', 'first', or a positive integer stride.") from None
+
+
+def lazy_sparse_fused_select_enabled() -> bool:
+    """Run selection as one kernel instead of ~470 PyTorch operations.
+
+    On by default. Set `LAZY_SPARSE_FUSED_SELECT=0` to fall back to the torch
+    implementation, which is unchanged and is what
+    `tests/sparse/test_selection.py` compares against -- so a disagreement can
+    be bisected by flipping this rather than by editing either path.
+    """
+    return _env_flag_default_on("LAZY_SPARSE_FUSED_SELECT")
 
 
 def lazy_sparse_dense_prefix_layers() -> int:

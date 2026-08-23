@@ -33,7 +33,11 @@ class Layout:
 
         self.num_doc_blocks = sum(self.padded) // block_size
         tail_blocks = (tail_tokens + block_size - 1) // block_size
-        num_blocks = self.num_doc_blocks + tail_blocks
+        # The scheduler emits an entry per document block *plus* one for the
+        # query block, so the table has to hold that entry even when the tail
+        # rounds to zero blocks. `seq_lens` still describes only the real rows,
+        # so the spare column is never walked.
+        num_blocks = max(self.num_doc_blocks + tail_blocks, len(q_offset))
 
         # The scheduler emits one entry per document block plus one for the
         # query block; later tail blocks inherit offset 0, meaning "keep the

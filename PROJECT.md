@@ -954,6 +954,68 @@ LazyRoute is a net loss at every corpus shape measured**, by 0.8 to 4.6
 ms/token, while removing 2.8 ms/token of real GPU work. The gap is host
 dispatch, not arithmetic.
 
+### 2026-08-23 — selection fused into one kernel; sparsity finally nets out positive
+
+Scoring was already one launch. Everything after it — ranking candidates,
+applying the budget and the sink stripe, compacting kept rows left, rebuilding
+`seq_lens` — was ~470 elementwise PyTorch operations over `[R, W]` tensors, and
+that dispatch, not the arithmetic, was the whole cost. `lazy/sparse/selection.py`
+does all of it in one program per request.
+
+**It collapses because the table has a hard width bound.** Sized for
+`max_model_len`, at 131k context and block 16 that is 8192 columns, so a row's
+scores are at most **32 KB of fp32** — small enough to live in one program's
+registers. Selection without a sort: map the float to an order-preserving
+unsigned key (sign-magnitude flip) and bisect it 32 times, each iteration a
+masked count of "how many candidates score at least this". That lands exactly on
+the budget-th largest key. Ties are broken by lower index; the torch path leaves
+them to its radix sort, so the two agree whenever scores are distinct and both
+are valid when they are not.
+
+**The launch budget, same measurement as before:**
+
+| | before | after |
+| --- | ---: | ---: |
+| host ops per route call | 477 | **96** |
+| CUDA kernels per call | 221 | **34** |
+| host time per call | 2783 us | **568 us** |
+| GPU time per call | 785 us | 542 us |
+| host / GPU | 3.5x | **1.0x** |
+| route call (cold geom) | 1.799 ms | **0.431 ms** |
+
+The router is no longer launch-bound. `derotate_query` is now the largest single
+phase at 0.272 ms of the 0.431, and is the obvious next thing to fold into the
+scorer.
+
+**It is the same selection.** 24 cases in `tests/sparse/test_selection.py` hold
+the kernel to the torch path across budgets, stripe and `keep_doc0` settings,
+absolute token budgets, non-routable rows, the guard's discontinuity, and ties.
+End to end: 100 2wiki examples at 10 documents, fused against torch,
+**100/100 identical generations** and identical EM. `kept_fraction` is 0.252 on
+both paths at 600 documents. The torch implementation is untouched and reachable
+via `LAZY_SPARSE_FUSED_SELECT=0`, which is how a suspected kernel bug gets
+bisected.
+
+**And it flips the sign.** Paired adjacent runs, three rounds, 600 documents:
+
+| round | Lazy-Attn | LazyRoute | Δ |
+| --- | ---: | ---: | ---: |
+| 1 | 11.58 | 9.15 | −2.43 |
+| 2 | 10.38 | 9.97 | −0.41 |
+| 3 | 11.07 | 9.94 | −1.13 |
+
+Median **−1.13 ms/token, faster in three rounds of three**, against **+0.8**
+under the same protocol before the fusion. This is the first configuration in
+which reading a quarter of the cache is faster than reading all of it, and it
+took fixing the decode kernel first (which removed the fake headroom sparsity
+had been credited with) and then removing the router's dispatch.
+
+At 10x6k the same change moves +1.8 to roughly a wash (−0.74 and +1.23 in the
+two clean rounds; the third was thermally contaminated). Fewer blocks — 3,794
+against 5,400 — means proportionally less to save against a router cost that is
+now small but not zero. The break-even estimate of ~500 documents from the
+previous entry no longer applies and has not been re-derived.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run
