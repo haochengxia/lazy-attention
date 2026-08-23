@@ -243,3 +243,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 paper/
+# LazyRoute raw probe tensors (regenerate with benchmarks/lazyroute/*.py)
+benchmarks/lazyroute/results/*.npz
