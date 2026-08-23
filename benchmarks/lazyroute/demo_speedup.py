@@ -403,6 +403,34 @@ def _fonts() -> tuple[str, str]:
     raise SystemExit("no DejaVuSansMono.ttf found; apt-get install fonts-dejavu")
 
 
+def _wrap(text: str, width: int) -> list[str]:
+    lines: list[str] = []
+    for para in text.split("\n"):
+        current = ""
+        for word in para.split(" "):
+            while len(word) > width:
+                if current:
+                    lines.append(current)
+                    current = ""
+                lines.append(word[:width])
+                word = word[width:]
+            candidate = word if not current else f"{current} {word}"
+            if len(candidate) <= width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+    return lines
+
+
+def _text_at(events: list[list], t_ms: float) -> str:
+    """What had actually been emitted by `t_ms` -- not a rendering of the whole
+    answer revealed on a timer. Each chunk carries the timestamp the engine
+    handed it over, so the text on screen is the text that existed then."""
+    return "".join(chunk for (at, chunk) in events if at <= t_ms)
+
+
 def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
                speed: float = 3.0) -> None:
     from PIL import Image, ImageDraw, ImageFont
@@ -416,6 +444,7 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
     f_cap = ImageFont.truetype(regular, 13)
     f_big = ImageFont.truetype(bold, 38)
     f_unit = ImageFont.truetype(regular, 15)
+    f_body = ImageFont.truetype(regular, 14)
     f_clock = ImageFont.truetype(bold, 18)
 
     BG, PANEL, BORDER = (13, 17, 23), (22, 27, 34), (48, 54, 61)
@@ -424,11 +453,13 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
     GREY, GREEN, CYAN = (139, 148, 158), (63, 185, 80), (56, 189, 248)
     ACCENTS = {DENSE: GREY, LAZY: GREEN, ROUTE: CYAN}
 
-    W, H, M = 1500, 620, 22
+    W, H, M = 1500, 742, 22
     panel_w = (W - 4 * M) // 3
-    p_top, p_h = 118, 452
+    p_top, p_h = 118, 574
     pad = 18
     bar_w = panel_w - 2 * pad
+    answer_chars = int((panel_w - 2 * pad) / f_body.getlength("M"))
+    ANSWER_LINES = 5
 
     sides = [(arm, arms[arm], arms[arm]["timelines"][index]) for arm in ARMS]
     t_end = max(side["end_ms"] for _, _, side in sides)
@@ -469,6 +500,9 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
         if len(arrivals) < 2:
             return len(arrivals), None
         return len(arrivals), (arrivals[-1] - arrivals[0]) / (len(arrivals) - 1)
+
+    def finished_text(side, t_ms):
+        return t_ms >= side["end_ms"]
 
     def draw(t_ms: float, frame_index: int, final: bool):
         image = Image.new("RGB", (W, H), BG)
@@ -518,39 +552,51 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
                    font=f_cap, fill=TEXT if emitted else DIM)
             bar(bx, p_top + 130, bar_w, 16, emitted / total_tokens, accent)
 
+            d.text((bx, p_top + 160), "ANSWER", font=f_cap, fill=DIM)
+            lines = _wrap(_text_at(side["events"], t_ms).strip(),
+                          answer_chars)[:ANSWER_LINES]
+            for row, line in enumerate(lines):
+                d.text((bx, p_top + 180 + row * 19), line, font=f_body,
+                       fill=TEXT)
+            if started and not finished_text(side, t_ms) and (
+                    frame_index // 3) % 2 == 0:
+                cx = bx + f_body.getlength(lines[-1] if lines else "")
+                cy = p_top + 180 + max(len(lines) - 1, 0) * 19
+                d.rectangle([cx + 1, cy + 2, cx + 8, cy + 15], fill=accent)
+
             # The live rate wobbles for the first few tokens and then settles;
             # once the arm is done, show the run's own mean rather than letting
             # a tail outlier stand as the headline number.
             finished = t_ms >= side["end_ms"]
             shown = stats[arm]["itl_ms"] if finished else live
-            d.text((bx, p_top + 178), "MILLISECONDS PER TOKEN", font=f_cap,
+            d.text((bx, p_top + 300), "MILLISECONDS PER TOKEN", font=f_cap,
                    fill=DIM)
             if shown is None:
-                d.text((bx, p_top + 196), "—", font=f_big, fill=TRACK)
+                d.text((bx, p_top + 318), "—", font=f_big, fill=TRACK)
             else:
                 text = f"{shown:.1f}"
-                d.text((bx, p_top + 196), text, font=f_big, fill=WHITE)
-                d.text((bx + f_big.getlength(text) + 8, p_top + 222), "ms/tok",
+                d.text((bx, p_top + 318), text, font=f_big, fill=WHITE)
+                d.text((bx + f_big.getlength(text) + 8, p_top + 344), "ms/tok",
                        font=f_unit, fill=DIM)
 
-            d.text((bx, p_top + 286), "KV CACHE READ EACH STEP", font=f_cap,
+            d.text((bx, p_top + 400), "KV CACHE READ EACH STEP", font=f_cap,
                    fill=DIM)
             share = f"{read[arm]:.0%}"
-            d.text((bx + bar_w - f_cap.getlength(share), p_top + 286), share,
+            d.text((bx + bar_w - f_cap.getlength(share), p_top + 400), share,
                    font=f_cap, fill=TEXT)
-            bar(bx, p_top + 308, bar_w, 16, read[arm], accent)
+            bar(bx, p_top + 422, bar_w, 16, read[arm], accent)
 
-            d.text((bx, p_top + 356), "TOTAL REQUEST TIME", font=f_cap,
+            d.text((bx, p_top + 466), "TOTAL REQUEST TIME", font=f_cap,
                    fill=DIM)
             if finished:
                 total = f"{stats[arm]['end_ms'] / 1000:.2f}"
-                d.text((bx, p_top + 374), total, font=f_big, fill=WHITE)
-                d.text((bx + f_big.getlength(total) + 8, p_top + 400), "s",
+                d.text((bx, p_top + 484), total, font=f_big, fill=WHITE)
+                d.text((bx + f_big.getlength(total) + 8, p_top + 510), "s",
                        font=f_unit, fill=DIM)
             else:
                 running = f"{t_ms / 1000:.2f}"
-                d.text((bx, p_top + 374), running, font=f_big, fill=DIM)
-                d.text((bx + f_big.getlength(running) + 8, p_top + 400),
+                d.text((bx, p_top + 484), running, font=f_big, fill=DIM)
+                d.text((bx + f_big.getlength(running) + 8, p_top + 510),
                        "s and counting", font=f_unit, fill=DIM)
 
         now = min(t_ms, t_end)

@@ -1035,6 +1035,49 @@ median, so the two did not multiply out. The animated example is now chosen as
 the one closest to typical in every arm at once, and every printed number is a
 median.
 
+### 2026-08-23 — real text, at 8B, and what it costs LazyRoute
+
+The figure could not show generated text because the 1B checkpoint stops
+producing words at about twenty documents. Confirmed properly this time: at 50,
+100, 200 and 600 documents it emits repetition, **dense included** (`Question`
+repeated forty times), so it is the checkpoint and not the sparse path; long
+documents do not help (10x60 paragraphs degenerates too), so the limit is
+context length rather than document count; and a copy-one-string needle task
+dies at the same place, so it is not task difficulty either.
+
+`ldsjmdy/Tulu3-Block-FT` (8B) fixes it, and fits on a 16 GB card only through
+bitsandbytes: fp8 quantises *after* the bf16 weights reach the GPU, so its peak
+is the unquantised 15 GB and it OOMs in the embedding loader, while
+bitsandbytes quantises during load — 5.65 GiB of weights, 7.66 GiB of KV cache,
+62,784 tokens. At 300 documents it answers properly, and
+`analysis/lazyroute_demo_8b.gif` shows the three arms' actual output streaming.
+
+| arm | TTFT | ms/token | total | answer |
+| --- | ---: | ---: | ---: | --- |
+| vLLM prefix caching | 29,693 ms | 40.7 | 32.15 s | finds Xawery Zulawski |
+| Lazy-Attn | 187 ms | 27.0 | 1.87 s | finds Xawery Zulawski |
+| LazyRoute | 617 ms | 30.1 | 2.50 s | **"is not mentioned"** |
+
+**159x to the first token, and on 8B Lazy-Attn also beats dense per token,
+1.51x** — it did not at 1B (0.86x), because thirty-two layers of attention over
+43k tokens is a large enough share of the step for the packed walk to pay.
+
+**LazyRoute costs an answer here, and time.** At a 25% budget it drops the page
+naming the director and confabulates a different film; on the needle task it
+finds the right document and quotes its *first* sentence while dropping the page
+holding the code — §9b's block-head finding reproducing at 8B, and an argument
+for `prefix` closure that is now much stronger than the n=200 flip count was.
+It is also 0.90x on decode and 3.3x worse on TTFT (617 against 187 ms), the
+latter being descriptor construction across thirty-two layers at prefill, which
+has never been measured and is not free.
+
+**Two caveats against reading the 0.90x as the 8B verdict.** bitsandbytes 4-bit
+dequantises every linear on every step, which inflates the non-attention part of
+the decode step and so shrinks sparsity's share of it — the comparison is
+distorted *against* routing by an amount not measured here. And 300 documents is
+2,700 blocks against the 5,400 at which routing paid on the 1B. Neither is a
+reason to disbelieve the accuracy result, which is the more important one.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run
