@@ -125,7 +125,7 @@ def _build_llm(arm: str, args):
                   gpu_memory_utilization=args.gpu_memory_utilization,
                   enable_prefix_caching=True,
                   trust_remote_code=True,
-                  enforce_eager=True,
+                  enforce_eager=not args.cuda_graphs,
                   max_num_seqs=args.batch)
     if arm == DENSE:
         return LLM(**kwargs)
@@ -619,6 +619,11 @@ def main() -> int:
     parser.add_argument("--frames", type=int, default=130)
     parser.add_argument("--speed", type=float, default=3.0)
     parser.add_argument("--out", default="analysis/lazyroute_demo.gif")
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="let vLLM capture the decode step. Everything "
+                             "measured so far ran eager, which exposes every "
+                             "one of the router's 477 dispatches; a captured "
+                             "step replays them as one submission")
     parser.add_argument("--json-dir", default="analysis")
     parser.add_argument("--rounds", type=int, default=1,
                         help="measure every arm this many times, round-robin. "
