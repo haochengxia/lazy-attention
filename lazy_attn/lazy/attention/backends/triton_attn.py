@@ -272,6 +272,10 @@ def forward(
                     block_size=attn_metadata.lazy_block_size,
                     key_cache=key_cache,
                     max_blocks=attn_metadata.lazy_max_blocks,
+                    # Memoises the step's query-independent geometry across
+                    # layers, on the same per-step object the walk table below
+                    # already uses.
+                    step_cache=attn_metadata,
                 )
                 attn_metadata.lazy_walk_table = walk
             decode_block_table = walk.block_table
@@ -465,7 +469,9 @@ def get_sparse_router_stats() -> dict[str, float]:
     """
     if _ROUTER is None:
         return {}
-    stats = dict(_ROUTER.stats)
+    # `sync_stats`, not `.stats`: the totals live on the device between log
+    # lines, so reading the dict directly reports zeros for a router that ran.
+    stats = dict(_ROUTER.sync_stats())
     if stats["rows_dense"]:
         stats["kept_fraction"] = stats["rows_kept"] / stats["rows_dense"]
     return stats

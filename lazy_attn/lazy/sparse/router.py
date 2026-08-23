@@ -49,7 +49,6 @@ from typing import Optional
 import torch
 
 from lazy.sparse.descriptors import MAX, MEAN, MIN, DescriptorStore
-from lazy.utils.rotation import MAX_PACKED_Q_OFFSET, PACKED_Q_OFFSET_SHIFT
 
 # Ceiling on the elements materialised by one scoring tile, in fp32. The
 # gather that broadcasts each document's query out to its pages is the router's
@@ -108,6 +107,38 @@ class WalkTable:
     rows_dense: Optional[torch.Tensor] = None  # [num_reqs] int32, for probes
 
 
+@dataclass
+class RouteGeometry:
+    """Everything about a step's layout that does not depend on the query.
+
+    Which rows exist, which belong to documents, which are free, how many rows
+    the budget buys, where the sink stripe would land: all of it is a function
+    of the packed table and the step's document geometry, and none of it
+    changes between layers. Recomputing it per layer was roughly forty kernel
+    launches per layer per step spent producing sixteen identical answers --
+    which matters here because the router is launch-bound, not bandwidth-bound
+    (its CPU time was double its GPU time).
+
+    Built once per step and cached on the step's attention metadata, the same
+    object the walk table already caches on, and rebuilt with it.
+    """
+    packed: torch.Tensor  # narrowed to the populated prefix
+    phys: torch.Tensor
+    doc_id: torch.Tensor
+    doc_offsets: torch.Tensor
+    safe_doc_id: torch.Tensor  # doc_id clamped to >= 0, int64, for gathers
+    index: torch.Tensor  # arange broadcast to the table's shape
+    block_valid: torch.Tensor
+    doc_mask: torch.Tensor
+    candidate: torch.Tensor  # chargeable against the budget
+    free_rows: torch.Tensor  # preamble | tail: kept regardless of score
+    within: torch.Tensor  # rank < budget, for the selection scatter
+    budget: torch.Tensor
+    tail_len: torch.Tensor
+    forced: Optional[torch.Tensor]  # sink-stripe bonus, or None if inactive
+    block_size: int
+
+
 def derotate_query(q: torch.Tensor, offsets: torch.Tensor,
                    cos_sin_cache: torch.Tensor,
                    rotary_dim: int) -> torch.Tensor:
@@ -123,35 +154,63 @@ def derotate_query(q: torch.Tensor, offsets: torch.Tensor,
     This mirrors `llama_v1.py` lines 223-248. Written out, the kernel's
     `q1`/`q2` construction broadcasts each half of Q across both halves, so the
     whole rotation collapses to a half-width pair of terms.
+
+    Two shapes of this are load-bearing for speed, since this runs once per
+    layer per decode step and the router is launch-bound rather than
+    bandwidth-bound:
+
+    * The halves are written into one preallocated buffer instead of being
+      `torch.cat`ed. The cat was a single 121 us kernel at M=600 -- 10% of the
+      router's entire GPU time -- spent copying tensors that were just built.
+    * There is no `torch.where` for the identity case. `offsets <= 1` maps to
+      table position 0, where a real RoPE table has cos=1 and sin=0, so the
+      arithmetic below is already bit-exactly the identity there. The old
+      explicit select was a second full-width pass to reproduce what the table
+      already gives. `tests/sparse/conftest.py::rope_table` builds a real table
+      for exactly this reason, and `test_derotation_is_identity_at_offset_one`
+      pins it.
     """
     half = rotary_dim // 2
     positions = (offsets.long() - 1).clamp(min=0)
-    table = cos_sin_cache[positions]  # [R, M, rotary_dim]
-    cos = table[..., :half].unsqueeze(2).float()  # [R, M, 1, D/2]
-    sin = table[..., half:].unsqueeze(2).float()
+    table = cos_sin_cache[positions].float()  # [R, M, rotary_dim]
+    cos = table[..., :half].unsqueeze(2)  # [R, M, 1, D/2]
+    sin = table[..., half:].unsqueeze(2)
 
     a = q[:, None, :, :half].float()  # [R, 1, H, D/2]
     b = q[:, None, :, half:].float()
-    rotated = torch.cat([a * cos + b * sin, -a * sin + b * cos], dim=-1)
-    # offset 1 (and the 0 sentinel) mean "already in the right frame".
-    identity = (offsets <= 1)[:, :, None, None]
-    return torch.where(identity, q[:, None, :, :].float(), rotated)
+    out = torch.empty((q.shape[0], offsets.shape[1], q.shape[1], rotary_dim),
+                      device=q.device,
+                      dtype=torch.float32)
+    torch.add(a * cos, b * sin, out=out[..., :half])
+    torch.sub(b * cos, a * sin, out=out[..., half:])
+    return out
 
 
 def _quest_bound(q: torch.Tensor, box: torch.Tensor) -> torch.Tensor:
     """Upper bound of q.k over the box, for every (block, kv_head).
 
-    `max(q*lo, q*hi)` summed over the head dimension, rewritten as
-    `q.centre + |q|.half_width` so it is two contractions instead of an
-    elementwise max over a materialised `[blocks, heads, dim]` product.
+    `sum_d max(q_d*lo_d, q_d*hi_d)`, rewritten as `q.centre + |q|.half_width`
+    so that each term is a contraction over the head dimension rather than an
+    elementwise max over a materialised product.
 
-    `q` is `[T, G, H, D]` (tile, GQA group member, kv head, dim) and `box` is
-    `[T, H, 2, D]`; the result is `[T, G, H]`.
+    Both contractions are issued as batched matrix-vector products. Written the
+    obvious way -- `(q * centre).sum(-1)` -- torch materialises a full
+    `[blocks, group, heads, dim]` intermediate per term, which at M=600 is 44 MB
+    written and read back twice; `aten::mul` and `aten::sum` together were 38%
+    of the router's GPU time. Folding the broadcast into the GEMV removes the
+    intermediate entirely.
+
+    `q` is `[N, H, G, D]` (block, kv head, GQA group member, dim) -- contiguous,
+    which is why `_score_blocks` no longer transposes into group-major order --
+    and `box` is `[N, H, 2, D]`. The result is `[N, H, G]`.
     """
+    n, h, g, d = q.shape
     lo, hi = box[:, :, MIN, :], box[:, :, MAX, :]
-    centre = ((lo + hi) * 0.5).unsqueeze(1)  # [T, 1, H, D]
-    half_width = ((hi - lo) * 0.5).unsqueeze(1)
-    return (q * centre).sum(-1) + (q.abs() * half_width).sum(-1)
+    centre = ((lo + hi) * 0.5).reshape(n * h, d, 1)
+    half_width = ((hi - lo) * 0.5).reshape(n * h, d, 1)
+    flat = q.reshape(n * h, g, d)
+    bound = torch.baddbmm(torch.bmm(flat, centre), flat.abs(), half_width)
+    return bound.reshape(n, h, g)
 
 
 class Router:
@@ -217,19 +276,22 @@ class Router:
             tile_doc = doc_id[:, start:stop].clamp(min=0).long()
             flat_phys = tile_phys.reshape(-1)
 
-            # q for each block, via its document: [R, T, H_q, D] -> grouped
+            # q for each block, via its document: [R, T, H_q, D]. Left in kv
+            # head-major order `[N, H, G, D]` rather than transposed into
+            # group-major: this is the layout `_quest_bound`'s GEMV wants, and
+            # reaching it costs a reshape of an already-contiguous tensor
+            # instead of a copy.
             q_tile = torch.gather(
                 q_by_doc, 1,
                 tile_doc[:, :, None, None].expand(-1, -1, q_by_doc.shape[2],
                                                   q_by_doc.shape[3]))
             t = q_tile.shape[1]
-            q_tile = q_tile.reshape(num_reqs * t, num_kv_heads, group,
-                                    -1).transpose(1, 2)
+            q_tile = q_tile.reshape(num_reqs * t, num_kv_heads, group, -1)
 
             if self.config.scorer == "oracle":
                 tile_score = self._oracle_score(key_cache, flat_phys, q_tile)
             elif self.config.scorer == "random":
-                tile_score = torch.rand((num_reqs * t, group, num_kv_heads),
+                tile_score = torch.rand((num_reqs * t, num_kv_heads, group),
                                         device=phys.device)
             else:
                 box, valid = self.store.boxes(layer_name, flat_phys)
@@ -237,17 +299,20 @@ class Router:
                     scores[:, start:stop] = float("inf")
                     continue
                 if self.config.scorer == "centroid":
-                    tile_score = (q_tile *
-                                  box[:, :, MEAN, :].unsqueeze(1)).sum(-1)
+                    n, h, g, d = q_tile.shape
+                    tile_score = torch.bmm(
+                        q_tile.reshape(n * h, g, d),
+                        box[:, :, MEAN, :].reshape(n * h, d,
+                                                   1)).reshape(n, h, g)
                 else:
                     tile_score = _quest_bound(q_tile, box)
 
-            # GQA aggregation, then per-kv-head max: a block is worth reading
-            # if any head in the group wants it.
+            # GQA aggregation over the group, then max over kv heads: a block is
+            # worth reading if any head in the group wants it.
             if self.config.gqa_agg == "sum":
-                per_head = tile_score.sum(1)
+                per_head = tile_score.sum(-1)
             else:
-                per_head = tile_score.amax(1)
+                per_head = tile_score.amax(-1)
             tile_out = per_head.amax(-1).reshape(num_reqs, t)
 
             if self.config.scorer not in ("oracle", "random"):
@@ -259,20 +324,22 @@ class Router:
 
     def _oracle_score(self, key_cache: torch.Tensor, flat_phys: torch.Tensor,
                       q_tile: torch.Tensor) -> torch.Tensor:
-        """True max q.k over each block -- an auxiliary dense read, eval only."""
+        """True max q.k over each block -- an auxiliary dense read, eval only.
+
+        `q_tile` is `[N, H, G, D]`; the result is `[N, H, G]`, matching what
+        `_quest_bound` returns so the aggregation below is scorer-agnostic.
+        """
         keys = DescriptorStore._keys_by_row(key_cache, flat_phys).float()
-        n, h, p, d = keys.shape
-        group = q_tile.shape[1]
-        qk = torch.einsum("nghd,nhpd->nghp", q_tile.reshape(n, group, h, d),
-                          keys)
+        qk = torch.einsum("nhgd,nhpd->nhgp", q_tile, keys)
         return qk.amax(-1)
 
     # -- selection ----------------------------------------------------------
 
-    def _select(self, scores: torch.Tensor, doc_id: torch.Tensor,
-                block_valid: torch.Tensor, doc_mask: torch.Tensor,
-                block_size: int) -> torch.Tensor:
-        """`[R, MB]` bool: which rows this step walks.
+    def _geometry(self, packed: torch.Tensor, seq_lens: torch.Tensor,
+                  doc_id: torch.Tensor, doc_offsets: torch.Tensor,
+                  num_doc_blocks: torch.Tensor, block_size: int,
+                  max_blocks: Optional[int]) -> RouteGeometry:
+        """Derive a step's query-independent layout. See `RouteGeometry`.
 
         Kept free of charge: every tail row, and -- under the preamble
         convention, `LAZY_SPARSE_KEEP_DOC0` -- document 0. Charged against the
@@ -287,6 +354,27 @@ class Router:
         real document is read for free.
         """
         cfg = self.config
+        # The block table is sized for `max_model_len`, not for what the batch
+        # allocated. Narrowing it to the populated prefix is the single largest
+        # lever in this file: at a 131k context the table is 8192 columns wide
+        # and a ten-document request fills about a hundred of them. The kernel
+        # reads `block_table_stride` off whatever tensor it is handed, so a
+        # narrower table needs no padding back out.
+        if max_blocks is not None:
+            width = max(min(max_blocks, packed.shape[1]), 1)
+            packed = packed[:, :width]
+            doc_id = doc_id[:, :width]
+            doc_offsets = doc_offsets[:, :width]
+
+        phys = (packed >> 32).to(torch.int64)
+        width = phys.shape[1]
+        arange = torch.arange(width, device=phys.device)
+        num_blocks = torch.div(seq_lens.int() + block_size - 1,
+                               block_size,
+                               rounding_mode="floor")
+        block_valid = arange[None, :] < num_blocks[:, None]
+        doc_mask = (arange[None, :] < num_doc_blocks[:, None]) & block_valid
+
         tail = block_valid & ~doc_mask
         if cfg.keep_doc0:
             preamble = doc_mask & (doc_id == 0)
@@ -295,16 +383,9 @@ class Router:
             preamble = torch.zeros_like(doc_mask)
             candidate = doc_mask
 
-        num_candidates = candidate.sum(1).int()
-        budget = cfg.budget_rows(num_candidates, block_size)
+        budget = cfg.budget_rows(candidate.sum(1).int(), block_size)
 
-        if cfg.granularity == "doc":
-            return preamble | tail | self._select_docs(
-                scores, doc_id, candidate, budget)
-
-        priority = torch.where(candidate, scores,
-                               torch.full_like(scores, float("-inf")))
-
+        forced = None
         stripe = self._stripe_rows(doc_id, candidate)
         if stripe is not None:
             # §9b's budget guard: below roughly twice its own cost the stripe
@@ -312,31 +393,61 @@ class Router:
             # Counted on the device and reported by `_maybe_log`; asking here
             # whether it tripped would sync once per layer per step.
             affordable = (stripe.sum(1).int() * 2) <= budget
-            stripe = stripe & affordable[:, None]
             self._stat_guard += (~affordable).sum()
-            priority = torch.where(stripe, priority + _FORCED, priority)
+            forced = torch.where(stripe & affordable[:, None],
+                                 torch.full_like(budget, _FORCED,
+                                                 dtype=torch.float32)[:, None],
+                                 torch.zeros((), dtype=torch.float32,
+                                             device=packed.device))
+
+        return RouteGeometry(
+            packed=packed,
+            phys=phys,
+            doc_id=doc_id,
+            doc_offsets=doc_offsets,
+            safe_doc_id=doc_id.clamp(min=0).long(),
+            index=arange.expand_as(phys),
+            block_valid=block_valid,
+            doc_mask=doc_mask,
+            candidate=candidate,
+            free_rows=preamble | tail,
+            within=arange[None, :] < budget[:, None],
+            budget=budget,
+            tail_len=seq_lens.int() - num_doc_blocks * block_size,
+            forced=forced,
+            block_size=block_size)
+
+    def _select(self, scores: torch.Tensor,
+                geometry: RouteGeometry) -> torch.Tensor:
+        """`[R, MB]` bool: which rows this step walks."""
+        cfg = self.config
+        if cfg.granularity == "doc":
+            return geometry.free_rows | self._select_docs(scores, geometry)
+
+        if geometry.forced is not None:
+            scores = scores + geometry.forced
+        priority = torch.where(geometry.candidate, scores,
+                               torch.full_like(scores, float("-inf")))
 
         # Rank every candidate and keep each request's own prefix. A `topk`
         # would need `k` on the host, and masking its result with a boolean
         # index is data-dependent -- both sync. Sorting the full width and
         # scattering a per-request cutoff is the same selection without either.
         order = priority.argsort(dim=1, descending=True)
-        within = (torch.arange(order.shape[1], device=scores.device)[None, :]
-                  < budget[:, None])
-        chosen = torch.zeros_like(candidate)
-        chosen.scatter_(1, order, within)
+        chosen = torch.zeros_like(geometry.candidate)
+        chosen.scatter_(1, order, geometry.within)
         # A row with fewer candidates than budget would otherwise pick up
         # whatever the sort put after the -inf entries.
-        chosen &= candidate
+        chosen &= geometry.candidate
 
         if cfg.granularity == "prefix":
-            chosen = self._close_prefixes(chosen, doc_id, candidate)
+            chosen = self._close_prefixes(chosen, geometry)
 
-        return preamble | tail | chosen
+        return geometry.free_rows | chosen
 
     @staticmethod
-    def _close_prefixes(chosen: torch.Tensor, doc_id: torch.Tensor,
-                        candidate: torch.Tensor) -> torch.Tensor:
+    def _close_prefixes(chosen: torch.Tensor,
+                        geometry: RouteGeometry) -> torch.Tensor:
         """Extend each document's selection down to its first page.
 
         If page 3 of a document is worth reading, pages 0-2 come with it. The
@@ -354,10 +465,7 @@ class Router:
         selection, so the budget is a floor rather than a ceiling. Compare arms
         by the reported `kept_fraction`, not by the budget they were asked for.
         """
-        width = chosen.shape[1]
-        index = torch.arange(width, device=chosen.device).expand_as(chosen)
-        safe_id = doc_id.clamp(min=0).long()
-
+        index, safe_id = geometry.index, geometry.safe_doc_id
         highest = torch.full_like(index, -1)
         highest.scatter_reduce_(1,
                                 safe_id,
@@ -365,11 +473,10 @@ class Router:
                                             torch.full_like(index, -1)),
                                 reduce="amax",
                                 include_self=True)
-        return candidate & (index <= highest.gather(1, safe_id))
+        return geometry.candidate & (index <= highest.gather(1, safe_id))
 
-    def _select_docs(self, scores: torch.Tensor, doc_id: torch.Tensor,
-                     candidate: torch.Tensor,
-                     budget: torch.Tensor) -> torch.Tensor:
+    def _select_docs(self, scores: torch.Tensor,
+                     geometry: RouteGeometry) -> torch.Tensor:
         """Whole documents, greedily by score until the budget is spent.
 
         Design rule R2: a document scores as the max over its pages, so the
@@ -386,7 +493,8 @@ class Router:
         # one block, so this is an upper bound, and reading the true count off
         # the device would sync once per layer per step. The spare slots stay
         # at -inf and lose every comparison.
-        safe_id = doc_id.clamp(min=0).long()
+        safe_id = geometry.safe_doc_id
+        candidate = geometry.candidate
         masked = torch.where(candidate, scores,
                              torch.full_like(scores, float("-inf")))
         per_doc = torch.full((num_reqs, num_docs),
@@ -406,7 +514,7 @@ class Router:
             fits = rank[None, :] < self.config.budget_docs
             fits = fits & (per_doc.gather(1, order) > float("-inf"))
         else:
-            fits = spend <= budget[:, None]
+            fits = spend <= geometry.budget[:, None]
 
         taken = torch.zeros_like(fits)
         taken.scatter_(1, order, fits)
@@ -432,29 +540,31 @@ class Router:
 
     @staticmethod
     def compact(packed: torch.Tensor, keep: torch.Tensor,
-                doc_mask: torch.Tensor, seq_lens: torch.Tensor,
-                num_doc_blocks: torch.Tensor,
+                doc_mask: torch.Tensor, tail_len: torch.Tensor,
                 block_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gather kept rows to the left, and rebuild `seq_lens` to match.
+        """Move kept rows to the left, and rebuild `seq_lens` to match.
 
-        `nonzero` yields indices in ascending (row, column) order, so the
-        scatter below preserves the original row order within each request --
-        which is invariant 1 and 2 in the module docstring, not an incidental
-        property of the implementation.
+        Each row's destination is computed rather than sorted for: a kept row
+        lands at its rank among kept rows, a dropped row after all of them. Both
+        ranks are prefix sums, so the two together are a permutation and the
+        scatter preserves the original order within each group -- which is
+        invariants 1 and 2 in the module docstring, not an incidental property.
+
+        A prefix sum rather than the `argsort` this used to do, and neither is
+        `nonzero`: `nonzero`'s output size is data-dependent and so syncs, which
+        is unaffordable once per layer per decode step, but the sort was doing
+        `O(n log n)` comparisons to recover an order that is already known.
         """
-        # Kept rows sort ahead of dropped ones while both keep their original
-        # order, because the sort key is the row index itself, shifted by the
-        # table width for anything dropped. `argsort` rather than `nonzero`
-        # deliberately: `nonzero`'s output size is data-dependent, so it forces
-        # a device-to-host sync -- and this runs once per layer per decode
-        # step, where a sync costs far more than the sort it saves.
-        width = keep.shape[1]
-        index = torch.arange(width, device=keep.device).expand_as(keep)
-        rank = torch.where(keep, index, index + width).argsort(dim=1)
-        walk = packed.gather(1, rank)
+        kept_rank = keep.cumsum(1)
+        kept_total = kept_rank[:, -1:]
+        dropped_rank = (~keep).cumsum(1) + kept_total
+        # -1 because `cumsum` counts the row itself; both branches are therefore
+        # 0-based and together cover [0, width).
+        destination = torch.where(keep, kept_rank, dropped_rank) - 1
+        walk = torch.empty_like(packed)
+        walk.scatter_(1, destination, packed)
 
         kept_doc_rows = (keep & doc_mask).sum(1).int()
-        tail_len = seq_lens.int() - num_doc_blocks * block_size
         return walk, kept_doc_rows * block_size + tail_len
 
     # -- entry point --------------------------------------------------------
@@ -466,85 +576,90 @@ class Router:
               query_start_loc: torch.Tensor, cos_sin_cache: torch.Tensor,
               rotary_dim: int, num_kv_heads: int, block_size: int,
               key_cache: Optional[torch.Tensor] = None,
-              max_blocks: Optional[int] = None) -> WalkTable:
+              max_blocks: Optional[int] = None,
+              step_cache: object = None) -> WalkTable:
         """Compact `packed`/`seq_lens` for every routable row; pass others through.
 
         `routable` marks lazy rows taking a single-token decode step. Prefill
         rows and non-lazy rows keep their dense table untouched -- prefill
         sparsification is an explicit non-goal, and a non-lazy row has no
         document region to route over.
+
+        `step_cache` is the step's attention metadata, used to memoise the
+        query-independent geometry across the layers of one step. Passing
+        nothing is correct and simply recomputes it, which is what the tests do.
+
+        Every row is scored and then discarded by `torch.where` if it was not
+        routable, rather than gathered up front. Selecting rows would mean
+        `nonzero`, whose output size is data-dependent and so syncs. A
+        non-routable row is harmless to score: its geometry says zero document
+        blocks, so nothing is indexed out of range and its result is thrown away
+        below.
         """
         self._ensure_counters(packed.device)
-        # The block table is sized for `max_model_len`, not for what the batch
-        # allocated. Narrowing it to the populated prefix is the single largest
-        # lever in this file: at a 131k context the table is 8192 columns wide
-        # and a ten-document request fills about a hundred of them. The kernel
-        # reads `block_table_stride` off whatever tensor it is handed, so a
-        # narrower table needs no padding back out.
-        if max_blocks is not None:
-            width = max(min(max_blocks, packed.shape[1]), 1)
-            packed = packed[:, :width]
-            doc_id = doc_id[:, :width]
-            doc_offsets = doc_offsets[:, :width]
-        # Every row is scored and then discarded by `torch.where` if it was not
-        # routable, rather than gathered up front. Selecting rows would mean
-        # `nonzero`, whose output size is data-dependent and so syncs -- and
-        # this runs per layer per decode step. A non-routable row is harmless
-        # to score: its geometry says zero document blocks, so nothing is
-        # indexed out of range and its result is thrown away below.
-        phys = (packed >> 32).to(torch.int64)
-        offsets = ((packed >> PACKED_Q_OFFSET_SHIFT)
-                   & MAX_PACKED_Q_OFFSET).to(torch.int32)
-        max_blocks = phys.shape[1]
-
-        arange = torch.arange(max_blocks, device=phys.device)
-        num_blocks = torch.div(seq_lens.int() + block_size - 1,
-                               block_size,
-                               rounding_mode="floor")
-        block_valid = arange[None, :] < num_blocks[:, None]
-        doc_mask = (arange[None, :] < num_doc_blocks[:, None]) & block_valid
+        geometry = getattr(step_cache, "lazy_route_geometry", None)
+        if geometry is None:
+            geometry = self._geometry(packed, seq_lens, doc_id, doc_offsets,
+                                      num_doc_blocks, block_size, max_blocks)
+            if step_cache is not None:
+                step_cache.lazy_route_geometry = geometry
+        packed = geometry.packed
 
         q = query[query_start_loc[:packed.shape[0]].long()]  # [R, H_q, D]
-        q_by_doc = derotate_query(q, doc_offsets, cos_sin_cache, rotary_dim)
+        q_by_doc = derotate_query(q, geometry.doc_offsets, cos_sin_cache,
+                                  rotary_dim)
 
-        scores = self._score_blocks(layer_name, q_by_doc, phys, doc_id,
-                                    num_kv_heads, key_cache)
-        scores = torch.where(doc_mask, scores,
-                             torch.full_like(scores, float("-inf")))
+        # Not masked to `doc_mask` here: `_select` admits only `candidate`,
+        # which is a subset of it, so the mask would be a second full-width pass
+        # to enforce what selection enforces anyway.
+        scores = self._score_blocks(layer_name, q_by_doc, geometry.phys,
+                                    geometry.doc_id, num_kv_heads, key_cache)
 
-        keep = self._select(scores, doc_id, block_valid, doc_mask, block_size)
-        sub_walk, sub_lens = self.compact(packed, keep, doc_mask, seq_lens,
-                                          num_doc_blocks, block_size)
+        keep = self._select(scores, geometry)
+        sub_walk, sub_lens = self.compact(packed, keep, geometry.doc_mask,
+                                          geometry.tail_len, block_size)
 
         walk = torch.where(routable[:, None], sub_walk, packed)
         out_lens = torch.where(routable, sub_lens, seq_lens.int())
 
         rows_kept = torch.where(routable, keep.sum(1).int(),
-                                block_valid.sum(1).int())
-        rows_dense = block_valid.sum(1).int()
+                                geometry.block_valid.sum(1).int())
+        rows_dense = geometry.block_valid.sum(1).int()
         self.stats["calls"] += 1
         self._stat_kept += rows_kept.sum()
         self._stat_dense += rows_dense.sum()
         self._maybe_log()
         return WalkTable(walk, out_lens, rows_kept, rows_dense)
 
+    def sync_stats(self) -> dict:
+        """Materialise the device counters into `self.stats` and return it.
+
+        Syncs, so this is for probes and log lines -- never the hot path. It is
+        separate from `_maybe_log` because the counters used to be read back
+        only when a log line was due: with `LAZY_SPARSE_PROFILE` unset, a
+        caller reading `stats` got `rows_kept=0, rows_dense=0` from a router
+        that had routed thousands of steps, which reads as "sparsity is off"
+        rather than "nobody asked for the number yet".
+        """
+        if self._stat_kept is not None:
+            self.stats["rows_kept"] = int(self._stat_kept)
+            self.stats["rows_dense"] = int(self._stat_dense)
+            self.stats["stripe_guard_trips"] = int(self._stat_guard)
+        return self.stats
+
     def _maybe_log(self) -> None:
         """Report walk lengths from inside the worker.
 
         The router lives in the EngineCore's worker process, so a caller in the
-        parent cannot read `self.stats` -- it would see a router that never ran.
-        Logging is the only channel that crosses, which is why this exists
-        rather than an accessor.
+        parent cannot read `self.stats` unless the worker is in-process
+        (`VLLM_ENABLE_V1_MULTIPROCESSING=0`). Logging is the channel that
+        always crosses, which is why this exists alongside the accessor.
         """
         if not self.profile_every:
             return
         if self.stats["calls"] % self.profile_every:
             return
-        # The only sync in the router, and only every `profile_every` calls.
-        self.stats["rows_kept"] = int(self._stat_kept)
-        self.stats["rows_dense"] = int(self._stat_dense)
-        self.stats["stripe_guard_trips"] = int(self._stat_guard)
-        dense = self.stats["rows_dense"]
+        dense = self.sync_stats()["rows_dense"]
         # `print`, not `logger`, and deliberately: this runs in the worker
         # process, and the repo's other worker-side probe (`LazyDecodeProfile`)
         # prints for the same reason.

@@ -571,6 +571,14 @@ class LazyGPUModelRunner(GPUModelRunner):
                 # that read would be a sync, per layer, per step.
                 metadata.lazy_sparse_decode = (metadata.max_query_len == 1
                                                and self._any_lazy_reqs)
+                # The router memoises per-step work on this object across the
+                # layers of a step. Upstream builds a fresh metadata object per
+                # step, so these would start empty anyway -- clearing them makes
+                # that an invariant this file enforces rather than one it
+                # inherits, since a recycled object would otherwise hand a later
+                # step a walk table built for an earlier one.
+                metadata.lazy_route_geometry = None
+                metadata.lazy_walk_table = None
 
     def _prepare_inputs(
         self,
