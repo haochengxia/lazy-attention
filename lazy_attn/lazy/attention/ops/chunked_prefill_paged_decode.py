@@ -27,6 +27,22 @@ from lazy.attention.ops.models.llama_split import (
 )
 
 
+_SM_COUNT: dict[int, int] = {}
+
+
+def _sm_count(device: torch.device) -> int:
+    """SM count, cached per device.
+
+    Asked once per layer per decode step otherwise, on a path whose whole
+    problem is host time -- and the answer does not change.
+    """
+    index = device.index if device.index is not None else 0
+    if index not in _SM_COUNT:
+        _SM_COUNT[index] = torch.cuda.get_device_properties(
+            device).multi_processor_count
+    return _SM_COUNT[index]
+
+
 def _launch_split_decode(*, output, query, key_cache, value_cache,
                          decode_block_table, decode_lens, alibi_slopes,
                          sm_scale, k_scale, v_scale, num_seqs,
@@ -46,8 +62,7 @@ def _launch_split_decode(*, output, query, key_cache, value_cache,
     head_size_padded = triton.next_power_of_2(head_size)
     splits = choose_splits(num_seqs, num_kv_heads,
                            triton.cdiv(max_seq_len, block_size),
-                           torch.cuda.get_device_properties(
-                               query.device).multi_processor_count)
+                           _sm_count(query.device))
     partial_acc, partial_m, partial_l = allocate_partials(
         num_seqs, num_kv_heads, splits, num_queries_per_kv_padded,
         head_size_padded, query.device)
@@ -272,7 +287,7 @@ def chunked_prefill_paged_decode(
         # before this, every lazy decode step drained the pipeline once per
         # layer to compute a boolean it then discarded. It also made the decode
         # path uncapturable, since a sync is illegal inside a CUDA graph.
-        use_split_decode = (force_split_decode and is_lazy is not None
+        use_lazy_only_kernel = (force_split_decode and is_lazy is not None
                             and bool(torch.all(is_lazy).item()))
         if profile_decode:
             total_start = torch.cuda.Event(enable_timing=True)
@@ -280,7 +295,7 @@ def chunked_prefill_paged_decode(
             kernel_start = torch.cuda.Event(enable_timing=True)
             kernel_end = torch.cuda.Event(enable_timing=True)
         decode_kernel = (kernel_paged_attention_2d_llama_lazy_only
-                         if use_split_decode
+                         if use_lazy_only_kernel
                          else kernel_paged_attention_2d_llama)
         # A sparse walk table already carries packed entries, so it supersedes
         # the packed table; without one the dense packed table is used, and
@@ -293,7 +308,7 @@ def chunked_prefill_paged_decode(
         if profile_decode:
             total_start.record()
             kernel_start.record()
-        if lazy_split_kv_enabled() and not use_split_decode:
+        if lazy_split_kv_enabled() and not use_lazy_only_kernel:
             _launch_split_decode(
                 output=output, query=query, key_cache=key_cache,
                 value_cache=value_cache, decode_block_table=decode_block_table,
@@ -370,7 +385,7 @@ def chunked_prefill_paged_decode(
             other_ms = max(total_ms - kernel_ms, 0.0)
             print(
                 f"LazyDecodeProfile num_seqs={num_seqs} max_seq_len={max_seq_len} "
-                f"heads={num_query_heads}/{num_kv_heads} split={int(use_split_decode)} "
+                f"heads={num_query_heads}/{num_kv_heads} lazyonly={int(use_lazy_only_kernel)} "
                 f"pack_ms={0.0:.3f} kernel_ms={kernel_ms:.3f} "
                 f"unpack_ms={0.0:.3f} total_ms={total_ms:.3f} other_ms={other_ms:.3f}",
                 flush=True,

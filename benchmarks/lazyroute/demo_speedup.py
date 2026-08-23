@@ -8,14 +8,17 @@ a single number hides that:
   a new order costs nothing to re-read. Stock prefix caching matches only on a
   shared token prefix, so it recomputes from the first block that moved. This
   shows up as time-to-first-token.
-- **LazyRoute vs Lazy-Attn** is a *decode* win. Every decode step reads a
-  query-selected subset of the cached pages instead of all of them. This shows
-  up as the inter-token interval -- the panel does not start sooner, it types
-  faster.
+- **LazyRoute vs Lazy-Attn** is a *read-volume* win: every decode step touches
+  a query-selected subset of the cached pages instead of all of them. Whether
+  that converts into wall-clock depends on what else is on the critical path.
+  At batch 1 with the split decode kernel it does not -- the attention it
+  removes is smaller than the router's own launch cost -- so this panel is
+  drawn as what it measurably is, a fraction of the cache read, next to its
+  honest per-token rate.
 
-So the demo has to show three panels and let the eye read both effects: two
-panels start together and beat the third off the line, and one of those two
-then pulls ahead while typing.
+So the demo shows three panels of measured quantities: two start together and
+beat the third off the line, and each reports its own decode rate and how much
+of the cache it reads to get it. Nothing on screen is a projection.
 
 **Method.** Each arm is measured alone, in its own process, with the whole GPU
 -- `demo_race.py`'s convention, and the only honest one on a single card, since
@@ -56,8 +59,8 @@ LABELS = {
 }
 BLURBS = {
     DENSE: "re-prefills from the first moved doc",
-    LAZY: "reuses every doc's KV, reads all of it",
-    ROUTE: "reuses every doc's KV, reads ~1/3 of it",
+    LAZY: "reuses every doc's KV · reads all of it",
+    ROUTE: "reuses every doc's KV · reads what the query needs",
 }
 
 MODEL = "hxia7/Llama-3.2-1B-block-FT"
@@ -82,6 +85,12 @@ def _configure_env(arm: str, route_layers: str = "4") -> None:
         return
     os.environ["VLLM_USE_LAZY_ATTENTION"] = "1"
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    # The serial decode kernel gives one CTA per (sequence, KV head) -- eight
+    # of them at batch 1, on a card with seventy SMs. Measuring sparsity
+    # against a kernel that leaves 90% of the GPU idle would credit the router
+    # for removing work the hardware was never going to spend. Split-KV is what
+    # the lazy arms should be judged as, so both of them get it.
+    os.environ.setdefault("LAZY_SPLIT_KV", "1")
     os.environ.pop("VLLM_WORKER_MULTIPROC_METHOD", None)
     if arm == ROUTE:
         os.environ["LAZY_SPARSE"] = "1"
@@ -357,34 +366,6 @@ def _fonts() -> tuple[str, str]:
     raise SystemExit("no DejaVuSansMono.ttf found; apt-get install fonts-dejavu")
 
 
-def _wrap(text: str, width: int) -> list[str]:
-    lines: list[str] = []
-    for para in text.split("\n"):
-        if not para:
-            lines.append("")
-            continue
-        current = ""
-        for word in para.split(" "):
-            while len(word) > width:
-                if current:
-                    lines.append(current)
-                    current = ""
-                lines.append(word[:width])
-                word = word[width:]
-            candidate = word if not current else f"{current} {word}"
-            if len(candidate) <= width:
-                current = candidate
-            else:
-                lines.append(current)
-                current = word
-        lines.append(current)
-    return lines
-
-
-def _text_at(events: list[list], t_ms: float) -> str:
-    return "".join(chunk for (at, chunk) in events if at <= t_ms)
-
-
 def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
                speed: float = 3.0) -> None:
     from PIL import Image, ImageDraw, ImageFont
@@ -395,10 +376,13 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
     f_head = ImageFont.truetype(bold, 19)
     f_note = ImageFont.truetype(regular, 14)
     f_badge = ImageFont.truetype(bold, 16)
-    f_body = ImageFont.truetype(regular, 15)
+    f_cap = ImageFont.truetype(regular, 13)
+    f_big = ImageFont.truetype(bold, 38)
+    f_unit = ImageFont.truetype(regular, 15)
     f_clock = ImageFont.truetype(bold, 18)
 
     BG, PANEL, BORDER = (13, 17, 23), (22, 27, 34), (48, 54, 61)
+    TRACK = (33, 39, 48)
     TEXT, DIM, WHITE = (201, 209, 217), (110, 118, 129), (240, 246, 252)
     GREY, GREEN, CYAN = (139, 148, 158), (63, 185, 80), (56, 189, 248)
     ACCENTS = {DENSE: GREY, LAZY: GREEN, ROUTE: CYAN}
@@ -406,85 +390,142 @@ def render_gif(arms: dict, out_path: str, index: int, frames: int = 130,
     W, H, M = 1500, 620, 22
     panel_w = (W - 4 * M) // 3
     p_top, p_h = 118, 452
-    pad, body_y = 16, 104
-    line_h = 21
-    body_top = p_top + body_y
-    max_chars = int((panel_w - 2 * pad) / f_body.getlength("M"))
-    max_lines = (p_h - body_y - 14) // line_h
+    pad = 18
+    bar_w = panel_w - 2 * pad
 
     sides = [(arm, arms[arm], arms[arm]["timelines"][index]) for arm in ARMS]
     t_end = max(side["end_ms"] for _, _, side in sides)
     span = t_end + max(300.0, 0.08 * t_end)
 
-    # Non-linear playback. The TTFT gap is decided in the first few hundred
-    # milliseconds while decode runs for seconds, so linear time would spend
-    # nine frames in ten on the part that is already settled. Most frames go to
-    # the start-line race; the rest fast-forward through decode, where the
-    # thing to see is a rate difference and a rate reads fine at speed.
-    dense_ttft = arms[DENSE]["timelines"][index]["ttft_ms"] or t_end
-    t_split = min(span, dense_ttft * 1.3 + 120.0)
-    n_race = max(1, int(frames * 0.45))
-    n_decode = max(1, frames - n_race)
+    # Two playback rates, because the two arms live on different time scales:
+    # the lazy arms answer in about a second while the dense arm is still
+    # prefilling at seventy. One linear axis spends every frame but two on an
+    # unchanging screen. So the first stretch of frames runs at the lazy arms'
+    # own pace, up to the moment they both finish, and the rest fast-forwards
+    # through the dense arm's prefill -- where the only thing that changes is
+    # the clock, and the clock reads fine at speed.
+    t_split = min(span, max(side["end_ms"] for arm, _, side in sides
+                            if arm != DENSE) * 1.12)
+    n_race = max(1, int(frames * 0.6))
+    n_ff = max(1, frames - n_race)
     times = ([i / n_race * t_split for i in range(n_race)]
-             + [t_split + (i + 1) / n_decode * (span - t_split)
-                for i in range(n_decode)])
+             + [t_split + (i + 1) / n_ff * (span - t_split)
+                for i in range(n_ff)])
+    warp = ((span - t_split) / n_ff) / max(t_split / n_race, 1e-9)
     hold = max(45, int(round(70 / max(speed, 1e-6) * 3)))
 
     stats = {arm: summarise(arms[arm]) for arm in ARMS}
     question = arms[LAZY]["timelines"][index]["question"]
     docs = arms[LAZY]["docs"]
-    kept = arms[ROUTE].get("router", {}).get("kept_fraction")
+    kept = arms[ROUTE].get("router", {}).get("kept_fraction") or 1.0
+    read = {DENSE: 1.0, LAZY: 1.0, ROUTE: kept}
+    total_tokens = max(len(side["events"]) for _, _, side in sides) or 1
+
+    def rate_at(side: dict, t_ms: float) -> tuple[int, float | None]:
+        """Tokens emitted by `t_ms`, and the ms/token implied so far.
+
+        Measured between the *arrivals*, not from the request start, so prefill
+        does not contaminate the decode rate -- and only once two tokens have
+        landed, since one arrival is a timestamp, not an interval.
+        """
+        arrivals = [at for at, _ in side["events"] if at <= t_ms]
+        if len(arrivals) < 2:
+            return len(arrivals), None
+        return len(arrivals), (arrivals[-1] - arrivals[0]) / (len(arrivals) - 1)
 
     def draw(t_ms: float, frame_index: int, final: bool):
         image = Image.new("RGB", (W, H), BG)
         d = ImageDraw.Draw(image)
-        d.text((M, 16), "LazyRoute: same answer, less of the cache read",
+
+        def bar(x, y, width, height, frac, colour):
+            d.rounded_rectangle([x, y, x + width, y + height],
+                                radius=height // 2, fill=TRACK)
+            filled = max(0.0, min(1.0, frac)) * width
+            if filled >= height:
+                d.rounded_rectangle([x, y, x + filled, y + height],
+                                    radius=height // 2, fill=colour)
+
+        d.text((M, 16), "One corpus, retrieved in a new order",
                font=f_title, fill=WHITE)
-        subtitle = (f"{docs} cached documents, retrieved in a new order  ·  "
+        subtitle = (f"{docs} documents prefilled once  ·  "
                     f"each engine measured alone on one GPU  ·  "
-                    f"playback {speed:g}x slower than real time")
+                    f"wall clock bottom-left, real measurements throughout")
         d.text((M, 48), subtitle, font=f_sub, fill=DIM)
         d.text((M, 72), f"Q: {question[:118]}", font=f_sub, fill=(150, 160, 172))
 
         for slot, (arm, data, side) in enumerate(sides):
             px = M + slot * (panel_w + M)
+            bx = px + pad
             accent = ACCENTS[arm]
             d.rounded_rectangle([px, p_top, px + panel_w, p_top + p_h],
                                 radius=10, fill=PANEL, outline=BORDER, width=1)
             d.rectangle([px, p_top, px + panel_w, p_top + 4], fill=accent)
-            d.text((px + pad, p_top + 14), LABELS[arm], font=f_head, fill=accent)
-            d.text((px + pad, p_top + 39), BLURBS[arm], font=f_note, fill=DIM)
+            d.text((bx, p_top + 14), LABELS[arm], font=f_head, fill=accent)
+            d.text((bx, p_top + 40), BLURBS[arm], font=f_note, fill=DIM)
 
             ttft = side["ttft_ms"]
             started = ttft is not None and t_ms >= ttft
-            if started:
-                emitted = sum(1 for at, _ in side["events"] if at <= t_ms)
-                badge = f"first token @ {ttft:.0f} ms   ·   {emitted} tok"
-                colour = accent
-            else:
-                badge = "prefilling …"
-                colour = DIM
-            d.text((px + pad, p_top + 62), badge, font=f_badge, fill=colour)
+            badge = (f"first token @ {ttft:,.0f} ms" if started
+                     else "prefilling …")
+            d.text((bx, p_top + 66), badge, font=f_badge,
+                   fill=accent if started else DIM)
 
-            lines = _wrap(_text_at(side["events"], t_ms), max_chars)[-max_lines:]
-            for i, line in enumerate(lines):
-                d.text((px + pad, body_top + i * line_h), line,
-                       font=f_body, fill=TEXT)
+            emitted, live = rate_at(side, t_ms)
+            d.text((bx, p_top + 108), "TOKENS GENERATED", font=f_cap, fill=DIM)
+            count = f"{emitted} / {total_tokens}"
+            d.text((bx + bar_w - f_cap.getlength(count), p_top + 108), count,
+                   font=f_cap, fill=TEXT if emitted else DIM)
+            bar(bx, p_top + 130, bar_w, 16, emitted / total_tokens, accent)
+
+            # The live rate wobbles for the first few tokens and then settles;
+            # once the arm is done, show the run's own mean rather than letting
+            # a tail outlier stand as the headline number.
             finished = t_ms >= side["end_ms"]
-            if started and not finished and (frame_index // 3) % 2 == 0:
-                last = lines[-1] if lines else ""
-                cx = px + pad + f_body.getlength(last)
-                cy = body_top + (max(len(lines), 1) - 1) * line_h
-                d.rectangle([cx + 1, cy + 2, cx + 9, cy + 17], fill=accent)
+            shown = stats[arm]["itl_ms"] if finished else live
+            d.text((bx, p_top + 178), "MILLISECONDS PER TOKEN", font=f_cap,
+                   fill=DIM)
+            if shown is None:
+                d.text((bx, p_top + 196), "—", font=f_big, fill=TRACK)
+            else:
+                text = f"{shown:.1f}"
+                d.text((bx, p_top + 196), text, font=f_big, fill=WHITE)
+                d.text((bx + f_big.getlength(text) + 8, p_top + 222), "ms/tok",
+                       font=f_unit, fill=DIM)
 
-        d.text((M, H - 34), f"t = {min(t_ms, t_end):6.0f} ms",
-               font=f_clock, fill=WHITE)
+            d.text((bx, p_top + 286), "KV CACHE READ EACH STEP", font=f_cap,
+                   fill=DIM)
+            share = f"{read[arm]:.0%}"
+            d.text((bx + bar_w - f_cap.getlength(share), p_top + 286), share,
+                   font=f_cap, fill=TEXT)
+            bar(bx, p_top + 308, bar_w, 16, read[arm], accent)
+
+            d.text((bx, p_top + 356), "TOTAL REQUEST TIME", font=f_cap,
+                   fill=DIM)
+            if finished:
+                total = f"{side['end_ms'] / 1000:.2f}"
+                d.text((bx, p_top + 374), total, font=f_big, fill=WHITE)
+                d.text((bx + f_big.getlength(total) + 8, p_top + 400), "s",
+                       font=f_unit, fill=DIM)
+            else:
+                running = f"{t_ms / 1000:.2f}"
+                d.text((bx, p_top + 374), running, font=f_big, fill=DIM)
+                d.text((bx + f_big.getlength(running) + 8, p_top + 400),
+                       "s and counting", font=f_unit, fill=DIM)
+
+        now = min(t_ms, t_end)
+        clock = (f"t = {now:6.0f} ms" if t_end < 10_000
+                 else f"t = {now / 1000:6.2f} s")
+        d.text((M, H - 34), clock, font=f_clock, fill=WHITE)
+        if t_ms > t_split and warp > 1.5 and not final:
+            d.text((M + f_clock.getlength(clock) + 24, H - 32),
+                   f"▶▶  fast-forwarding {warp:,.0f}x", font=f_note, fill=DIM)
         if final:
-            ttft_gain = stats[DENSE]["ttft_ms"] / max(stats[LAZY]["ttft_ms"], 1e-9)
-            itl_gain = stats[LAZY]["itl_ms"] / max(stats[ROUTE]["itl_ms"], 1e-9)
-            kept_note = f" reading {kept:.0%} of the cache" if kept else ""
-            message = (f"first token {ttft_gain:.1f}x sooner   ·   "
-                       f"then {itl_gain:.2f}x faster per token{kept_note}")
+            ttft_gain = stats[DENSE]["ttft_ms"] / max(stats[LAZY]["ttft_ms"],
+                                                      1e-9)
+            message = (f"first token {ttft_gain:,.0f}x sooner   ·   "
+                       f"{stats[LAZY]['itl_ms']:.1f} vs "
+                       f"{stats[DENSE]['itl_ms']:.1f} ms/token   ·   "
+                       f"LazyRoute reads {kept:.0%} of the cache")
             width = f_clock.getlength(message)
             d.text((W - M - width, H - 34), message, font=f_clock, fill=CYAN)
         return image
@@ -513,9 +554,11 @@ def report(arms: dict) -> None:
     print(f"\nprefill: {LABELS[LAZY]} reaches the first token "
           f"{stats[DENSE]['ttft_ms'] / stats[LAZY]['ttft_ms']:.2f}x sooner "
           f"than {LABELS[DENSE]}")
-    print(f"decode : {LABELS[ROUTE]} emits tokens "
-          f"{stats[LAZY]['itl_ms'] / stats[ROUTE]['itl_ms']:.2f}x faster "
-          f"than {LABELS[LAZY]}")
+    print(f"decode : {LABELS[LAZY]} vs {LABELS[DENSE]} "
+          f"{stats[DENSE]['itl_ms'] / stats[LAZY]['itl_ms']:.2f}x, "
+          f"{LABELS[ROUTE]} vs {LABELS[LAZY]} "
+          f"{stats[LAZY]['itl_ms'] / stats[ROUTE]['itl_ms']:.2f}x "
+          f"(>1 is a speedup)")
     kept = arms[ROUTE].get("router", {}).get("kept_fraction")
     if kept:
         print(f"         reading {kept:.1%} of the cached rows")
@@ -586,8 +629,8 @@ def main() -> int:
                        "--seed", str(args.seed), "--json-dir", args.json_dir,
                        "--route-layers", args.route_layers,
                        "--batch", str(args.batch)]
-        if not args.reorder:
-            command.append("--no-reorder")
+            if not args.reorder:
+                command.append("--no-reorder")
             result = subprocess.run(command, cwd=_REPO)
             if result.returncode != 0:
                 raise SystemExit(f"arm {arm} failed ({result.returncode})")

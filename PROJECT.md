@@ -730,6 +730,92 @@ still unmeasured against the <5% budget; that is P3.3's question. That
 measurement, and the Phase-1 exit check against §9b's offline 0.919 / 0.937,
 are the next things owed.
 
+### 2026-08-23 — the decode kernel was the bottleneck, not the cache reads
+
+Phase 1's premise — that reading a quarter of the cache makes decode faster — was
+being validated against a decode kernel about ten times slower than it needed to
+be. Fixing the kernel inverts the result, so this entry records the fix, the
+overhead measurement §10.6 asked for, and what the two together say.
+
+**The kernel.** `kernel_paged_attention_2d_llama` launches a grid of
+`(num_seqs, num_kv_heads)`. At batch 1 on this 8-KV-head model that is **eight
+thread blocks on a 70-SM card**, each walking the whole block table serially.
+`llama_split.py` adds the flash-decoding form — the walk is cut into `NUM_SPLITS`
+ranges whose partial softmaxes are merged by rescaling to a common max — selected
+by `LAZY_SPLIT_KV`. `llama_v1.py` is untouched, so R1 holds. Per layer at 600
+cached documents (~78k tokens):
+
+| arm | serial | split | |
+| --- | ---: | ---: | ---: |
+| Lazy-Attn | 3.931 ms | 0.364 ms | 10.8x |
+| LazyRoute | 1.322 ms | 0.182 ms | 7.3x |
+
+Two lazy-specific details had to survive the cut and are the reason
+`tests/kernels/test_split_decode.py` exists: each split restarts its
+`prev_rot_offset`, so it re-rotates at its own first row rather than inheriting
+the previous split's Q; and `q_mask` and the sequence boundary are indexed by the
+**absolute** row, so split ranges pass absolute indices through. Eight cases hold
+the split kernel to the serial one across ragged padding, exact blocks, one long
+document, many short ones, walks shorter than the split count, and non-lazy rows.
+
+Removed alongside it: `torch.all(is_lazy).item()` ran on **every lazy decode
+layer** to compute a boolean that a default-off switch then discarded. That is a
+device-to-host sync per layer per step, and it also made the decode path
+uncapturable, since a sync is illegal inside a CUDA graph.
+
+**Router overhead, the measurement §10.6 owed.** 1B, 600 documents, batch 1,
+split kernel on, two examples forced to 96 tokens each so every arm decodes the
+same number of steps (`demo_speedup.py --arm route --route-layers ...`):
+
+| route calls / step | ms/token | over Lazy-Attn |
+| --- | ---: | ---: |
+| 0 (Lazy-Attn) | 10.6 | — |
+| 1 (`first`) | 17.2 | +6.6 |
+| 4 (stride 4) | 24.9 | +14.3 |
+| 14 (`all`) | 61.3 | +50.7 |
+
+Linear in the call count at ~3.4 ms per call over ~3.2 ms/step of fixed geometry.
+Against the <5% budget the stride-4 default costs **+135% of the decode step** —
+off by a factor of about 27, and off by 62% even at one call per step.
+
+The cost is **not arithmetic**. `router_profile.py --docs 600` puts the same call
+at 0.853 ms of GPU time warm, 1.489 ms cold; wall clock is ~4x that. This agrees
+with the earlier control experiment — replaying the identical kernels from a
+captured CUDA graph ran 8.2x faster at 10 documents and 1.7x at 600 — so what is
+being paid for is dispatch, not work. Batch 4 and batch 8 were tried and did not
+rescue it.
+
+**The consequence.** Sparsity removes ~2.9 ms/token of GPU work at this corpus
+size (14 routed layers x 0.182 ms saved). The router adds 14.3 ms/token of host
+work to obtain it. With the serial kernel the saving was ~3.8 ms/*layer* and the
+trade looked positive; with the kernel fixed, batch-1 decode is CPU-launch-bound
+and the saving has nothing to buy. **At batch 1, on 1B, LazyRoute is a net loss
+at every stride tested** — and it is a loss whose size is set by how many times
+the router is invoked, not by how much cache it skips.
+
+This does not touch the selection results. Mass recall, KL and the `prefix`
+granularity findings above are statements about *which* pages are chosen and are
+unaffected by what the walk costs. It does move the burden onto P3.3: the three
+things that could change the arithmetic are CUDA-graph capture of the router (the
+control experiment bounds the win at ~1.7x here), batch sizes past 8, and models
+where per-layer attention is a larger share of the step than it is at 1B.
+
+**Demo.** `benchmarks/lazyroute/demo_speedup.py` measures three arms — each alone
+on the GPU, driving `LLMEngine.step()` with `RequestOutputKind.DELTA` so every
+point is a token that actually arrived — and renders them side by side. At 600
+documents served in a new order:
+
+| arm | TTFT | ms/token | total |
+| --- | ---: | ---: | ---: |
+| vLLM prefix caching | 77,104 ms | 10.79 | 78.34 s |
+| Lazy-Attn | 132 ms | 10.38 | 1.13 s |
+| LazyRoute (kept 0.252) | 139 ms | 24.25 | 2.55 s |
+
+**583x to the first token, and 1.04x per token after it.** The panels show token
+counters, measured rates and cache-read fraction rather than generated text: at
+600 documents the 1B checkpoint's output is degenerate (§9b — it is incoherent
+past roughly 20 documents), and the timings are real whether or not the text is.
+
 ## 10. Immediate next actions (this week)
 
 1. ~~Freeze the environment per `scripts/install.sh`; run the repo test suite on the 1B model; run
@@ -748,5 +834,9 @@ are the next things owed.
   leaves owed, in order: the **Phase-1 exit check** (engine mass recall at budget 0.25 on
   2wiki M=10 against §9b's offline 0.919 / 0.937 — agreement is what says the engine
   implements the measured object, and a gap is a router bug rather than a new result);
-  the **router overhead breakdown** via `scripts/benchmark/bench_decode_probe.sh` against
-  the <5% budget; then W1.5's oracle arm at scale and the `route_layers=first` ablation.
+  then W1.5's oracle arm at scale. ~~The router overhead breakdown against the <5%
+  budget.~~ **Done 2026-08-23 (§9b): it fails the budget by ~27x at the stride-4
+  default, the cost is dispatch rather than arithmetic, and with the decode kernel
+  fixed sparsity is a net loss at batch 1.** That makes P3.3 — CUDA-graph capture of
+  the router — the gating item for the whole speed claim, ahead of further selection
+  work.
